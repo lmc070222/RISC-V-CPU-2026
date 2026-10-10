@@ -10,5 +10,6 @@ rename.sv
 issue_queue.sv
 rob.sv
 store_buffer.sv
+icache.sv
 btb_bht.sv
 student_top.sv

@@ -9,7 +9,7 @@
 module student_top import pkg_cpu2026::*; #(
     parameter int FETCH_DEPTH = 4,
     parameter int FIFO_DEPTH  = 4,
-    parameter int DBG         = 0
+    parameter int DBG         = 2
 ) (
     input  logic        clock,
     input  logic        reset,
@@ -90,18 +90,23 @@ module student_top import pkg_cpu2026::*; #(
 
     // ================= 取指单元 =================
     logic [31:0] fetch_pc;
-    logic [2:0]  fetch_outstanding;
-    logic [2:0]  drain_cnt;
     logic [95:0] fq [0:FIFO_DEPTH-1];   // {pc, instr, predicted_target}
     logic [1:0]  fq_wptr, fq_rptr;
     logic [2:0]  fq_cnt;
-    logic [64:0] ro_q [0:7];            // {predicted_target, fetched_pc, type}
+    logic [0:7]  ro_type;               // 在飞读类型：0=I-cache 重填，1=LSU
     logic [2:0]  ro_wptr, ro_rptr;
     logic [3:0]  ro_cnt;
 
-    logic fetch_req_valid, lsu_req_valid, fetch_fire, lsu_fire, resp_type;
-    logic [31:0] resp_pd_target;
-    logic [31:0] resp_pc;
+    logic lsu_req_valid, lsu_fire, lsu_rd_resp;
+
+    // I-cache fetch 查询流水（1 拍）
+    logic [31:0] lf_pc, lf_pd;
+    logic        lf_on;
+    logic        ic_req_ready, ic_hit;
+    logic [31:0] ic_data;
+    logic        ic_rd_req, ic_rd_ready, ic_resp_valid;
+    logic [31:0] ic_rd_addr, ic_resp_data;
+    logic        fq_pop;
 
     // 取指重定向（来自 BRU）
     logic        redirect_fire;
@@ -115,7 +120,7 @@ module student_top import pkg_cpu2026::*; #(
 
     btb_bht u_btb_bht (
         .clk(clock), .reset(reset),
-        .pc(fetch_pc),
+        .pc(launch_pc),
         .predict_hit(f_pred_hit),
         .predict_taken(f_pred_taken),
         .predict_target(f_pred_target),
@@ -124,7 +129,7 @@ module student_top import pkg_cpu2026::*; #(
         .upd_taken(br_taken),
         .upd_target(br_actual_target)
     );
-    assign predicted_next = (f_pred_hit && f_pred_taken) ? f_pred_target : fetch_pc + 32'd4;
+    assign predicted_next = (f_pred_hit && f_pred_taken) ? f_pred_target : launch_pc + 32'd4;
 
     // ================= 自修改代码安全：store 未提交前阻塞取指 =================
     // 课程正确性测试含"数据与代码重叠"的程序（无 FENCE.I 要求，参考实现为顺序取指），
@@ -157,18 +162,14 @@ module student_top import pkg_cpu2026::*; #(
         end
     end
 
-    // 取指请求门控：store 在飞时禁止新请求
-    assign fetch_req_valid = !reset && !halted && !redirect_fire && !store_inflight &&
-                             !store_disp_fire && (drain_cnt == 3'd0) &&
-                             (fq_cnt + fetch_outstanding < FETCH_DEPTH) &&
-                             (ro_cnt < 4'd8);
-    assign rd_req_valid = lsu_req_valid || fetch_req_valid;
-    assign rd_req_addr  = lsu_req_valid ? lsu_addr : fetch_pc;
-    assign fetch_fire   = fetch_req_valid && !lsu_req_valid && rd_req_ready;
+    // 读端口仲裁：LSU 优先，I-cache 重填让位；在飞类型记入 ro_q 供响应路由
+    assign rd_req_valid = lsu_req_valid || ic_rd_req;
+    assign rd_req_addr  = lsu_req_valid ? lsu_addr : ic_rd_addr;
+    assign ic_rd_ready  = rd_req_ready && !lsu_req_valid;
     assign lsu_fire     = lsu_req_valid && rd_req_ready;
-    assign resp_type      = ro_q[ro_rptr][0];
-    assign resp_pd_target = ro_q[ro_rptr][64:33];
-    assign resp_pc        = ro_q[ro_rptr][32:1];
+    assign ic_resp_valid = rd_resp_valid && (ro_type[ro_rptr] == 1'b0);
+    assign ic_resp_data  = rd_resp_data;
+    assign lsu_rd_resp   = rd_resp_valid && (ro_type[ro_rptr] == 1'b1);
 
     // ================= 派发 =================
     logic [31:0] fd_pc, fd_instr, fd_pd_target;
@@ -630,8 +631,8 @@ module student_top import pkg_cpu2026::*; #(
     logic [31:0] lsu_addr;   // 读请求地址（与 fetch 仲裁）
     assign lsu_addr = ls_addr;
 
-    // load 读请求：WAIT_SB 且不 stall 且不 forward → 发请求
-    assign lsu_req_valid = !reset && !halted &&
+    // load 读请求：WAIT_SB 且不 stall 且不 forward → 发请求（flush 当拍不发，避免无主在飞请求）
+    assign lsu_req_valid = !reset && !halted && !flush_valid &&
                            (ls_state == LS_WAIT_SB) && ls_is_load &&
                            !sb_query_stall && !sb_query_forward;
     assign sb_query_valid = (ls_state == LS_WAIT_SB) && ls_is_load;
@@ -640,9 +641,9 @@ module student_top import pkg_cpu2026::*; #(
     assign sb_query_size = (ls_op[5:3] == LD_LW)  ? 2'd2 :
                            (ls_op[5:3] == LD_LH || ls_op[5:3] == LD_LHU) ? 2'd1 : 2'd0;
 
-    // 响应路由：load 响应到达且 LSU 在等待
+    // 响应路由：load 响应到达且 LSU 在等待（丢弃计数为 0 才认为是本 load 的响应）
     logic load_resp_route;
-    assign load_resp_route = rd_resp_valid && (resp_type == 1'b1) &&
+    assign load_resp_route = lsu_rd_resp && (lsu_drain == 4'd0) &&
                              (ls_state == LS_WAIT_MEM) && ls_is_load;
 
     // load 数据字节提取 + 符号扩展
@@ -672,6 +673,21 @@ module student_top import pkg_cpu2026::*; #(
         end else begin
             ls_strb = 4'hF;
             ls_shift = 5'd0;
+        end
+    end
+
+    // LSU 在飞请求丢弃计数：被冲刷的投机 load 请求已在途，其响应先到；
+// 吞掉这些响应，避免误配给下一笔真实 load（响应按序返回，drain 先于当前响应归零）
+    logic [3:0] lsu_drain;
+    always_ff @(posedge clock) begin
+        if (reset) begin
+            lsu_drain <= 4'd0;
+        end else begin
+            if (flush_valid && (ls_state == LS_WAIT_MEM) &&
+                is_younger(ls_rob, flush_rob_id) && !lsu_rd_resp)
+                lsu_drain <= lsu_drain + 4'd1;
+            else if (lsu_rd_resp && (lsu_drain != 4'd0))
+                lsu_drain <= lsu_drain - 4'd1;
         end
     end
 
@@ -717,7 +733,7 @@ module student_top import pkg_cpu2026::*; #(
             end
             default: ls_state <= LS_IDLE;
             endcase
-            // flush 在飞 load/store（读请求已发出则响应到达后由状态检查丢弃；
+            // flush 在飞 load/store（读请求已发出则计入 drain 由响应路径吞掉；
             // 同时清掉可能残留的 done 写回）
             if (flush_valid && (ls_state != LS_IDLE) && is_younger(ls_rob, flush_rob_id)) begin
                 ls_state <= LS_IDLE;
@@ -829,55 +845,63 @@ module student_top import pkg_cpu2026::*; #(
         return (a - rob_head_id) > (b - rob_head_id);
     endfunction
 
-    // ================= 取指单元 =================
-    logic fetch_resp_route, fetch_resp_discard, fq_pop;
-    assign fetch_resp_route   = rd_resp_valid && (resp_type == 1'b0) && (drain_cnt == 3'd0) && !redirect_fire;
-    assign fetch_resp_discard = rd_resp_valid && (resp_type == 1'b0) && (drain_cnt != 3'd0) && !redirect_fire;
+    // ================= 取指单元（I-cache 驱动）=================
     assign fq_pop             = disp_valid && disp_ready;
+
+    // 查询发射条件：查询槽空闲（或本拍消费）且 I-cache 可接收且 FIFO 有空间
+    // 消费同拍再发射时，新查询的 pc 是本拍命中的预测目标 lf_pd
+    logic [31:0] launch_pc;
+    logic ic_launch;
+    assign launch_pc = (lf_on && ic_hit) ? lf_pd : fetch_pc;
+    assign ic_launch = !reset && !halted && !redirect_fire && ic_req_ready &&
+                       (!lf_on || ic_hit) &&
+                       ((fq_cnt + (lf_on ? 3'd1 : 3'd0)) < FIFO_DEPTH);
+
+    icache #(.LINES(64), .LINE_WORDS(8), .MAXOUT(4)) u_icache (
+        .clk(clock), .reset(reset),
+        .req_pc(launch_pc), .req_valid(ic_launch), .req_ready(ic_req_ready),
+        .hit(ic_hit), .hit_data(ic_data),
+        .rd_req(ic_rd_req), .rd_ready(ic_rd_ready), .rd_addr(ic_rd_addr),
+        .resp_valid(ic_resp_valid), .resp_data(ic_resp_data)
+    );
 
     always_ff @(posedge clock) begin
         if (reset) begin
             fetch_pc <= 32'd0;
-            fetch_outstanding <= 3'd0;
-            drain_cnt <= 3'd0;
+            lf_on <= 1'b0;
             fq_wptr <= 2'd0; fq_rptr <= 2'd0; fq_cnt <= 3'd0;
             ro_wptr <= 3'd0; ro_rptr <= 3'd0; ro_cnt <= 4'd0;
         end else begin
-            if (fetch_fire) begin
-                fetch_pc <= predicted_next;          // 按预测前进
-                ro_q[ro_wptr] <= {predicted_next, fetch_pc, 1'b0};
-            end
-            if (lsu_fire) begin
-                ro_q[ro_wptr] <= {32'd0, 32'd0, 1'b1};
-            end
-            if (fetch_fire || lsu_fire) ro_wptr <= ro_wptr + 3'd1;
-            if (rd_resp_valid) ro_rptr <= ro_rptr + 3'd1;
-            if (fetch_resp_route) begin
-                fq[fq_wptr] <= {resp_pd_target, resp_pc, rd_resp_data};
-                fq_wptr <= fq_wptr + 2'd1;
-            end
             if (redirect_fire) begin
                 fetch_pc <= fetch_redirect_target;
-                // 累加式 drain：支持 drain 期间再次重定向（旧请求计数并入）
-                drain_cnt <= drain_cnt + fetch_outstanding
-                           - ((rd_resp_valid && (resp_type == 1'b0)) ? 3'd1 : 3'd0);
-                fetch_outstanding <= 3'd0;
-                fq_wptr <= 2'd0; fq_rptr <= 2'd0; fq_cnt <= 3'd0;
-            end else if (store_disp_fire) begin
-                // store 派发：清空 FIFO 并排空在飞取指（fetch_pc 保持，提交后重定向）
-                drain_cnt <= drain_cnt + fetch_outstanding
-                           - ((rd_resp_valid && (resp_type == 1'b0)) ? 3'd1 : 3'd0);
-                fetch_outstanding <= 3'd0;
+                lf_on <= 1'b0;
                 fq_wptr <= 2'd0; fq_rptr <= 2'd0; fq_cnt <= 3'd0;
             end else begin
-                fetch_outstanding <= fetch_outstanding
-                                   + (fetch_fire ? 3'd1 : 3'd0)
-                                   - (fetch_resp_route ? 3'd1 : 3'd0);
-                if (fetch_resp_discard) drain_cnt <= drain_cnt - 3'd1;
-                fq_cnt <= fq_cnt + (fetch_resp_route ? 3'd1 : 3'd0) - (fq_pop ? 3'd1 : 3'd0);
+                // 命中：入队并前进（lf_on 未必清零——同拍可能再次发射）
+                if (lf_on && ic_hit) begin
+                    fq[fq_wptr] <= {lf_pd, lf_pc, ic_data};
+                    if (DBG >= 2)
+                        $fdisplay(dbg_fd, "[fqpush] c=%0d pc=%08h instr=%08h", cycle_cnt, lf_pc, ic_data);
+                    fq_wptr <= fq_wptr + 2'd1;
+                    fetch_pc <= lf_pd;
+                    lf_on <= 1'b0;
+                end else if (lf_on && !ic_hit) begin
+                    // 缺失：等待重填完成后对同一 pc 重发
+                    lf_on <= 1'b0;
+                end
+                if (ic_launch) begin
+                    lf_on <= 1'b1;
+                    lf_pc <= launch_pc;
+                    lf_pd <= predicted_next;
+                end
+                fq_cnt <= fq_cnt + ((lf_on && ic_hit) ? 3'd1 : 3'd0) - (fq_pop ? 3'd1 : 3'd0);
                 if (fq_pop) fq_rptr <= fq_rptr + 2'd1;
             end
-            ro_cnt <= ro_cnt + ((fetch_fire || lsu_fire) ? 4'd1 : 4'd0)
+            if (ic_rd_req && ic_rd_ready) ro_type[ro_wptr] <= 1'b0;
+            if (lsu_fire)                ro_type[ro_wptr] <= 1'b1;
+            if ((ic_rd_req && ic_rd_ready) || lsu_fire) ro_wptr <= ro_wptr + 3'd1;
+            if (rd_resp_valid) ro_rptr <= ro_rptr + 3'd1;
+            ro_cnt <= ro_cnt + (((ic_rd_req && ic_rd_ready) || lsu_fire) ? 4'd1 : 4'd0)
                               - (rd_resp_valid ? 4'd1 : 4'd0);
         end
     end
@@ -933,9 +957,9 @@ module student_top import pkg_cpu2026::*; #(
                               rn_ps1, rn_s1_ready, rn_ps2, rn_s2_ready,
                               rn_dec.is_store, rn_dec.is_load);
                 if (DBG >= 2) begin
-                    $fdisplay(dbg_fd, "[fetch] c=%0d pc=%08h fq=%0d out=%0d drain=%0d ro=%0d lsu=%0d si=%b scf=%b sdf=%b tgt=%08h",
-                              cycle_cnt, fetch_pc, fq_cnt, fetch_outstanding, drain_cnt, ro_cnt, ls_state,
-                              store_inflight, store_commit_fire, store_disp_fire, fetch_redirect_target);
+                    $fdisplay(dbg_fd, "[fetch] c=%0d pc=%08h fq=%0d lf=%b ic_hit=%b ro=%0d lsu=%0d tgt=%08h",
+                              cycle_cnt, fetch_pc, fq_cnt, lf_on, ic_hit, ro_cnt, ls_state,
+                              fetch_redirect_target);
                     if (fq_cnt != 3'd0 && !disp_ready)
                         $fdisplay(dbg_fd, "[dispstall] c=%0d rob_rdy=%b iq_alu=%b iq_mdu=%b iq_lsu=%b iq_bru=%b sb=%b",
                                   cycle_cnt, rob_alloc_ready, iq_alu_alloc_ready, iq_mdu_alloc_ready,

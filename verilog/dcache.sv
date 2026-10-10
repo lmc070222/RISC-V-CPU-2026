@@ -156,9 +156,14 @@ module dcache #(
     );
 
     // ---- 对外输出 ----
-    assign ld_ready  = !reset && (state == D_IDLE);
-    assign ld_hit    = (state == D_LD) && valid[q_idx] && (tag_rdata == get_tag(q_addr));
-    assign ld_data   = data_rdata;
+    // early restart：重填中 load 所需字一到即完成（不等整行），省去后续字的等待
+    logic        early_pend;
+    logic [31:0] early_data;
+    wire early_fire = (state == D_REF) && resp_valid && (r_done == get_word(q_addr)) && !early_pend;
+    assign ld_ready  = !reset && ((state == D_IDLE) || early_fire);
+    assign ld_hit    = early_pend ||
+                       ((state == D_LD) && valid[q_idx] && (tag_rdata == get_tag(q_addr)));
+    assign ld_data   = early_pend ? early_data : data_rdata;
     assign st_accept = !reset && (state == D_IDLE) && st_req && !ld_req && !st_to_axi;
 
     // ---- 重填读请求 ----
@@ -193,6 +198,14 @@ module dcache #(
             st_cache_done <= 1'b0;
             st_b_done <= 1'b0;
 
+            // early restart：捕捉 load 所需字，下一拍作为命中结果交付（单拍）
+            if (early_fire) begin
+                early_pend <= 1'b1;
+                early_data <= resp_data;
+            end else if (early_pend) begin
+                early_pend <= 1'b0;
+            end
+
             // ============ 主状态 ============
             case (state)
             D_IDLE: begin
@@ -202,7 +215,7 @@ module dcache #(
                 end else if (st_req) begin
                     if (st_is_exit) begin
                         st_to_axi <= 1'b1; st_axi_exit <= 1'b1;
-                        st_axi_addr <= st_addr; st_axi_data <= st_data; st_axi_strb <= st_strb;
+                        st_axi_addr <= {st_addr[31:2], 2'b00}; st_axi_data <= st_data; st_axi_strb <= st_strb;
                     end else begin
                         q_addr <= st_addr; q_idx <= get_idx(st_addr); q_is_st <= 1'b1;
                         st_q_addr <= st_addr; st_q_data <= st_data; st_q_strb <= st_strb;
@@ -234,7 +247,7 @@ module dcache #(
                     st_cache_done <= 1'b1;
                 end else begin
                     st_to_axi <= 1'b1; st_axi_exit <= 1'b0;
-                    st_axi_addr <= st_q_addr; st_axi_data <= st_q_data; st_axi_strb <= st_q_strb;
+                    st_axi_addr <= {st_q_addr[31:2], 2'b00}; st_axi_data <= st_q_data; st_axi_strb <= st_q_strb;
                 end
                 state <= D_IDLE;
             end
@@ -253,7 +266,8 @@ module dcache #(
                 if (resp_valid) begin
                     if (r_done == WW'(LINE_WORDS-1)) begin
                         valid[r_idx] <= 1'b1;
-                        refill_busy <= 1'b0;
+            refill_busy <= 1'b0;
+            early_pend <= 1'b0;
                         state <= D_IDLE;
                     end else begin
                         r_done <= r_done + WW'(1);

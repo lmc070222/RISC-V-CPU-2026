@@ -172,10 +172,12 @@ module student_top import pkg_cpu2026::*; #(
     end
 
     // 读端口仲裁：D-cache 重填优先，I-cache 重填让位；在飞类型记入 ro_q 供响应路由
-    assign rd_req_valid = dc_rd_req || ic_rd_req;
+    // ro_q 满（ro_cnt==8）时禁止再接受新读，防止类型位被回绕覆盖
+    wire roq_full = (ro_cnt >= 4'd8);
+    assign rd_req_valid = (dc_rd_req || ic_rd_req) && !roq_full;
     assign rd_req_addr  = dc_rd_req ? dc_rd_addr : ic_rd_addr;
-    assign dc_rd_ready  = rd_req_ready;
-    assign ic_rd_ready  = rd_req_ready && !dc_rd_req;
+    assign dc_rd_ready  = rd_req_ready && !roq_full;
+    assign ic_rd_ready  = rd_req_ready && !dc_rd_req && !roq_full;
     assign ic_resp_valid = rd_resp_valid && (ro_type[ro_rptr] == 1'b0);
     assign dc_resp_valid = rd_resp_valid && (ro_type[ro_rptr] == 1'b1);
     assign ic_resp_data  = rd_resp_data;
@@ -278,7 +280,7 @@ module student_top import pkg_cpu2026::*; #(
 
     assign disp_valid = !reset && !halted && (fq_cnt != 3'd0) && !flush_valid && !illegal_halt;
 
-    rename #(.WB_PORTS(4)) u_rename (
+    rename #(.WB_PORTS(4), .ROB_DEPTH(16), .ROB_ID_W(ROB_W)) u_rename (
         .clk(clock), .reset(reset),
         .disp_valid(disp_valid),
         .ext_ready(ext_ready),
@@ -411,7 +413,7 @@ module student_top import pkg_cpu2026::*; #(
     // ================= D-cache =================
     assign sb_store_done = dc_st_cache_done | dc_st_b_done;
 
-    dcache #(.LINES(64), .LINE_WORDS(8), .MAXOUT(4)) u_dcache (
+    dcache #(.LINES(256), .LINE_WORDS(8), .MAXOUT(4)) u_dcache (
         .clk(clock), .reset(reset),
         .ld_req(dc_ld_req), .ld_addr(dc_ld_addr), .ld_ready(dc_ld_ready),
         .ld_hit(dc_ld_hit), .ld_data(dc_ld_data),
@@ -657,11 +659,15 @@ module student_top import pkg_cpu2026::*; #(
     logic        ls_is_load;
     logic        ls_ld_go;        // 已向 D-cache 发起查询，等下一拍结果
 
-    assign sb_query_valid = (ls_state == LS_WAIT_SB) && ls_is_load;
-    assign sb_query_rob_id = ls_rob;
-    assign sb_query_addr = ls_addr;
-    assign sb_query_size = (ls_op[5:3] == LD_LW)  ? 2'd2 :
-                           (ls_op[5:3] == LD_LH || ls_op[5:3] == LD_LHU) ? 2'd1 : 2'd0;
+    // SB 查询：LS_WAIT_SB 常规路径 + 发射当拍快路径（省一级气泡）
+    wire sbq_wait  = (ls_state == LS_WAIT_SB) && ls_is_load;
+    wire sbq_issue = (ls_state == LS_IDLE) && iq_lsu_issue && !flush_valid && !iq_lsu_issue_op[7];
+    wire [2:0] sbq_ld = sbq_wait ? ls_op[5:3] : iq_lsu_issue_op[5:3];
+    assign sb_query_valid = sbq_wait || sbq_issue;
+    assign sb_query_rob_id = sbq_wait ? ls_rob : iq_lsu_issue_rob;
+    assign sb_query_addr = sbq_wait ? ls_addr : (iq_lsu_issue_op1 + iq_lsu_issue_imm);
+    assign sb_query_size = (sbq_ld == LD_LW)  ? 2'd2 :
+                           (sbq_ld == LD_LH || sbq_ld == LD_LHU) ? 2'd1 : 2'd0;
 
     // D-cache load 查询（LS_LD 状态；握手后一拍取样结果）
     assign dc_ld_req   = !reset && !halted && (ls_state == LS_LD) && !ls_ld_go;
@@ -715,7 +721,19 @@ module student_top import pkg_cpu2026::*; #(
                     ls_data <= iq_lsu_issue_op2;
                     ls_is_load <= ~iq_lsu_issue_op[7];
                     if (iq_lsu_issue_op[7]) ls_state <= LS_STORE;
-                    else                    ls_state <= LS_WAIT_SB;
+                    else if (sb_query_stall) ls_state <= LS_WAIT_SB;
+                    else if (sb_query_forward) begin
+                        ls_result <= sb_query_data;
+                        ls_done_valid <= 1'b1;
+                        ls_state <= LS_IDLE;
+                        if (DBG >= 2)
+                            $fdisplay(dbg_fd, "[ldq] c=%0d rob=%0d addr=%08h data=%08h",
+                                      cycle_cnt, iq_lsu_issue_rob, iq_lsu_issue_op1 + iq_lsu_issue_imm,
+                                      sb_query_data);
+                    end else begin
+                        ls_state <= LS_LD;
+                        ls_ld_go <= 1'b0;
+                    end
                 end
             end
             LS_STORE: begin
@@ -909,6 +927,10 @@ module student_top import pkg_cpu2026::*; #(
                     lf_on <= 1'b1;
                     lf_pc <= launch_pc;
                     lf_pd <= predicted_next;
+                    if (DBG >= 2)
+                        $fdisplay(dbg_fd, "[launch] c=%0d pc=%08h pred=%08h hit=%b tk=%b tgt=%08h",
+                                  cycle_cnt, launch_pc, predicted_next, f_pred_hit, f_pred_taken,
+                                  f_pred_target);
                 end
                 fq_cnt <= fq_cnt + ((lf_on && ic_hit) ? 3'd1 : 3'd0) - (fq_pop ? 3'd1 : 3'd0);
                 if (fq_pop) fq_rptr <= fq_rptr + 2'd1;
@@ -924,11 +946,16 @@ module student_top import pkg_cpu2026::*; #(
 
     // ================= 终止 =================
     logic illegal_halt;
+    int   cnt_ic_rd, cnt_dc_rd;
     always_ff @(posedge clock) begin
         if (reset) begin
             halted <= 1'b0;
             illegal_halt <= 1'b0;
+            cnt_ic_rd <= 0;
+            cnt_dc_rd <= 0;
         end else begin
+            if (ic_rd_req && ic_rd_ready) cnt_ic_rd <= cnt_ic_rd + 1;
+            if (dc_rd_req && dc_rd_ready) cnt_dc_rd <= cnt_dc_rd + 1;
             if (exit_ack) halted <= 1'b1;
             if (rob_commit_valid && rob_commit_illegal && !illegal_halt) begin
                 illegal_halt <= 1'b1;
@@ -948,7 +975,7 @@ module student_top import pkg_cpu2026::*; #(
         if (reset) cycle_cnt <= 0;
         else begin
             cycle_cnt <= cycle_cnt + 1;
-            if (DBG) begin
+            if (DBG >= 2) begin
                 for (int j = 0; j < 3; j++)
                     if (cdb_valid[j])
                         $fdisplay(dbg_fd, "[cdb] c=%0d port=%0d rob=%0d pdst=%0d data=%08h",
@@ -959,17 +986,17 @@ module student_top import pkg_cpu2026::*; #(
                               rob_commit_has_rd, rob_commit_old_pdst, rob_commit_is_store,
                               sb_commit_valid);
                 if (flush_valid)
-                    $fdisplay(dbg_fd, "[flush] c=%0d rob=%0d target=%08h",
-                              cycle_cnt, flush_rob_id, redirect_target);
+                    $fdisplay(dbg_fd, "[flush] c=%0d rob=%0d target=%08h pred=%08h brpc=%08h head=%0d tail=%0d",
+                              cycle_cnt, flush_rob_id, redirect_target, rob_lookup_pd_target,
+                              br_r_pc, rob_head_id, rob_next_id);
                 if (rob_flush_free_valid && DBG >= 2)
                     $fdisplay(dbg_fd, "[free] c=%0d pdst=%0d", cycle_cnt, rob_flush_free_pdst);
                 if (redirect_fire)
                     $fdisplay(dbg_fd, "[fetch] c=%0d REDIRECT to %08h", cycle_cnt, redirect_target);
                 if (exit_ack)
-                    $fdisplay(dbg_fd, "[cpu] c=%0d EXIT_ACK", cycle_cnt);
-                if (rn_valid)
-                    $fdisplay(dbg_fd, "[disp] c=%0d rob=%0d pc=%08h pdst=%0d ps1=%0d s1r=%b ps2=%0d s2r=%b st=%b ld=%b",
-                              cycle_cnt, rn_alloc_rob_id, rn_pc, rn_alloc_pdst,
+                    $fdisplay(dbg_fd, "[cpu] c=%0d EXIT_ACK ic_rd=%0d dc_rd=%0d", cycle_cnt, cnt_ic_rd, cnt_dc_rd);                if (rn_valid)
+                    $fdisplay(dbg_fd, "[disp] c=%0d rob=%0d pc=%08h pdst=%0d pdt=%08h ps1=%0d s1r=%b ps2=%0d s2r=%b st=%b ld=%b",
+                              cycle_cnt, rn_alloc_rob_id, rn_pc, rn_alloc_pdst, fd_pd_target,
                               rn_ps1, rn_s1_ready, rn_ps2, rn_s2_ready,
                               rn_dec.is_store, rn_dec.is_load);
                 if (DBG >= 2) begin

@@ -10,7 +10,9 @@ module issue_queue #(
     parameter int WAKEUP_PORTS  = 3,
     parameter int PRF_W         = 6,
     parameter int ROB_ID_W      = 4,
-    parameter int OP_W          = 8
+    parameter int OP_W          = 8,
+    parameter logic STORE_ORDER = 0,
+    parameter logic DEBUG       = 0
 ) (
     input  logic clk,
     input  logic reset,
@@ -18,6 +20,7 @@ module issue_queue #(
     // ---- 入队 ----
     input  logic                    alloc_valid,
     output logic                    alloc_ready,
+    output logic                    alloc_ready_2,   // 空闲槽 >= 2（覆盖在飞分配的第二拍竞态）
     input  logic [ROB_ID_W-1:0]     alloc_rob_id,
     input  logic [PRF_W-1:0]        alloc_pdst,
     input  logic                    alloc_has_rs1,
@@ -81,18 +84,22 @@ module issue_queue #(
     // ================= 入队槽查找 =================
     logic [IDX_W-1:0] free_idx;
     logic             has_free;
+    logic [IDX_W:0]   free_cnt;
     always_comb begin
         free_idx = '0;
         has_free = 1'b0;
+        free_cnt = '0;
         for (int i = 0; i < IQ_DEPTH; i++) begin
             if (!valid[i]) begin
-                free_idx = IDX_W'(i);
+                if (!has_free) free_idx = IDX_W'(i);
                 has_free = 1'b1;
-                break;
+                free_cnt = free_cnt + 1'b1;
             end
         end
     end
     assign alloc_ready = !reset && has_free;
+    // 派发检查用：需容纳本拍在飞分配（rn 寄存器导致分配比派发检查晚一拍）
+    assign alloc_ready_2 = !reset && (free_cnt >= (IDX_W+1)'(2));
 
     // 入队当拍唤醒旁路（rename 的 s1_ready 不含当拍 CDB，这里补齐）
     logic        alloc_w1_match, alloc_w2_match;
@@ -179,13 +186,38 @@ module issue_queue #(
     // ================= 选择（ISSUE_WIDTH 轮，环序最老优先）=================
     logic [ROB_ID_W-1:0] age [0:IQ_DEPTH-1];
     logic                ready [0:IQ_DEPTH-1];
+    logic                ld_blocked [0:IQ_DEPTH-1];
     for (genvar i = 0; i < IQ_DEPTH; i++) begin : g_age
         assign age[i]   = rob_id[i] - head_rob_id;   // 模 2^W 环距
         // flush 当拍禁止发射：防止被冲分支进入 FU 产生幽灵重定向
         assign ready[i] = !issue_block && !flush_valid && valid[i] &&
                           (!has_rs1[i] || s1_ready[i]) &&
-                          (!has_rs2[i] || s2_ready[i]);
+                          (!has_rs2[i] || s2_ready[i]) &&
+                          !ld_blocked[i];
     end
+
+    // STORE_ORDER=1 时（LSU 队列）：load 不得越过未发射的旧 store——
+    // 旧 store 地址未解析时 SB 查询会 stall load，而旧 store 又因 LSU
+    // 被占无法发射，形成循环等待死锁。
+    generate
+        if (STORE_ORDER) begin : g_so
+            for (genvar i = 0; i < IQ_DEPTH; i++) begin : g_so_i
+                logic older_store;
+                always_comb begin
+                    older_store = 1'b0;
+                    for (int j = 0; j < IQ_DEPTH; j++) begin
+                        if (valid[j] && op[j][7] && (age[j] < age[i]))
+                            older_store = 1'b1;
+                    end
+                    ld_blocked[i] = !op[i][7] && older_store;
+                end
+            end
+        end else begin : g_nso
+            for (genvar i = 0; i < IQ_DEPTH; i++) begin : g_nso_i
+                assign ld_blocked[i] = 1'b0;
+            end
+        end
+    endgenerate
 
     logic [ISSUE_WIDTH-1:0]            sel_found;
     logic [ISSUE_WIDTH-1:0][IDX_W-1:0] sel_idx;
@@ -229,5 +261,32 @@ module issue_queue #(
         assign issue_pc[r]     = pc[sel_idx[r]];
         assign issue_op[r]     = op[sel_idx[r]];
     end
+
+`ifndef SYNTHESIS
+    if (DEBUG) begin : g_dbg
+        integer dbg_cyc = 0;
+        always @(posedge clk) begin
+            dbg_cyc <= dbg_cyc + 1;
+            if (!reset) begin
+                for (int i = 0; i < IQ_DEPTH; i++) begin
+                    for (int j = 0; j < WAKEUP_PORTS; j++) begin
+                        if (valid[i] && has_rs1[i] && !s1_ready[i] && wakeup_valid[j] &&
+                            (wakeup_tag[j] == p1[i]))
+                            $display("[iq-wake] c=%0d rob=%0d tag=%0d p1=%0d", dbg_cyc, rob_id[i], wakeup_tag[j], p1[i]);
+                    end
+                end
+                if (alloc_valid && alloc_ready)
+                    $display("[iq-alloc] c=%0d rob=%0d p1=%0d s1r=%b w1m=%b wv=%b",
+                             dbg_cyc, alloc_rob_id, alloc_p1, alloc_s1_ready, alloc_w1_match,
+                             {wakeup_valid[0], wakeup_valid[1], wakeup_valid[2], wakeup_valid[3]});
+                if (alloc_valid && !alloc_ready)
+                    $display("[iq-drop] c=%0d rob=%0d p1=%0d", dbg_cyc, alloc_rob_id, alloc_p1);
+                if (sel_found[0])
+                    $display("[iq-iss] c=%0d rob=%0d p1=%0d s1r=%b", dbg_cyc, rob_id[sel_idx[0]],
+                             p1[sel_idx[0]], s1_ready[sel_idx[0]]);
+            end
+        end
+    end
+`endif
 
 endmodule

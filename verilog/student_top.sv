@@ -92,20 +92,39 @@ module student_top import pkg_cpu2026::*; #(
     logic [31:0] fetch_pc;
     logic [2:0]  fetch_outstanding;
     logic [2:0]  drain_cnt;
-    logic [31:0] resp_pc;
-    logic [63:0] fq [0:FIFO_DEPTH-1];
+    logic [95:0] fq [0:FIFO_DEPTH-1];   // {pc, instr, predicted_target}
     logic [1:0]  fq_wptr, fq_rptr;
     logic [2:0]  fq_cnt;
-    logic        ro_q [0:7];
+    logic [64:0] ro_q [0:7];            // {predicted_target, fetched_pc, type}
     logic [2:0]  ro_wptr, ro_rptr;
     logic [3:0]  ro_cnt;
 
     logic fetch_req_valid, lsu_req_valid, fetch_fire, lsu_fire, resp_type;
+    logic [31:0] resp_pd_target;
+    logic [31:0] resp_pc;
 
     // 取指重定向（来自 BRU）
     logic        redirect_fire;
     logic [31:0] redirect_target;
     logic [31:0] fetch_redirect_target;
+
+    // ================= 分支预测（BTB + BHT）=================
+    logic        f_pred_hit, f_pred_taken;
+    logic [31:0] f_pred_target;
+    logic [31:0] predicted_next;
+
+    btb_bht u_btb_bht (
+        .clk(clock), .reset(reset),
+        .pc(fetch_pc),
+        .predict_hit(f_pred_hit),
+        .predict_taken(f_pred_taken),
+        .predict_target(f_pred_target),
+        .upd_valid(br_r_valid),
+        .upd_pc(br_r_pc),
+        .upd_taken(br_taken),
+        .upd_target(br_actual_target)
+    );
+    assign predicted_next = (f_pred_hit && f_pred_taken) ? f_pred_target : fetch_pc + 32'd4;
 
     // ================= 自修改代码安全：store 未提交前阻塞取指 =================
     // 课程正确性测试含"数据与代码重叠"的程序（无 FENCE.I 要求，参考实现为顺序取指），
@@ -116,9 +135,11 @@ module student_top import pkg_cpu2026::*; #(
     logic        store_disp_fire;
     logic        store_commit_fire;
 
-    // store 派发当拍触发（store 位于 FIFO 头，其后条目立即作废）
-    assign store_disp_fire   = disp_valid && disp_ready && fd_store && !store_inflight && !flush_valid;
-    assign store_commit_fire = rob_commit_valid && rob_commit_is_store && store_inflight;
+    // store 屏障已移除：取指不再串行等待 store 提交，
+    // load/store 顺序由 SB 前递（地址/数据就绪检查 + 已提交未释放 stall）保证；
+    // 结构冒险由 LSU 单发射串行 + LSU IQ 的 STORE_ORDER 约束兜底。
+    assign store_disp_fire   = 1'b0;
+    assign store_commit_fire = 1'b0;
 
     always_ff @(posedge clock) begin
         if (reset) begin
@@ -145,13 +166,16 @@ module student_top import pkg_cpu2026::*; #(
     assign rd_req_addr  = lsu_req_valid ? lsu_addr : fetch_pc;
     assign fetch_fire   = fetch_req_valid && !lsu_req_valid && rd_req_ready;
     assign lsu_fire     = lsu_req_valid && rd_req_ready;
-    assign resp_type    = ro_q[ro_rptr];
+    assign resp_type      = ro_q[ro_rptr][0];
+    assign resp_pd_target = ro_q[ro_rptr][64:33];
+    assign resp_pc        = ro_q[ro_rptr][32:1];
 
     // ================= 派发 =================
-    logic [31:0] fd_pc, fd_instr;
+    logic [31:0] fd_pc, fd_instr, fd_pd_target;
     dec_info_t   fd_dec;
     assign fd_pc    = fq[fq_rptr][63:32];
     assign fd_instr = fq[fq_rptr][31:0];
+    assign fd_pd_target = fq[fq_rptr][95:64];
     decoder u_fdec (.instr(fd_instr), .dec(fd_dec));
 
     logic fd_alu, fd_mul, fd_lsu, fd_bru, fd_store, fd_has_rd;
@@ -189,6 +213,7 @@ module student_top import pkg_cpu2026::*; #(
     logic        rob_commit_free_valid;
     logic [PRF_W-1:0] rob_commit_free_pdst;
     logic        rob_commit_free_taken;
+    logic [31:0] rob_lookup_pd_target;
     logic        rob_flush_free_valid;
     logic [PRF_W-1:0] rob_flush_free_pdst;
     logic        rob_flush_free_done;
@@ -209,10 +234,10 @@ module student_top import pkg_cpu2026::*; #(
     logic [31:0] sb_query_data;
 
     // ================= IQ×4 =================
-    logic iq_alu_alloc_valid, iq_alu_alloc_ready, iq_alu_issue;
-    logic iq_mdu_alloc_valid, iq_mdu_alloc_ready, iq_mdu_issue;
-    logic iq_lsu_alloc_valid, iq_lsu_alloc_ready, iq_lsu_issue;
-    logic iq_bru_alloc_valid, iq_bru_alloc_ready, iq_bru_issue;
+    logic iq_alu_alloc_valid, iq_alu_alloc_ready, iq_alu_alloc_ready_2, iq_alu_issue;
+    logic iq_mdu_alloc_valid, iq_mdu_alloc_ready, iq_mdu_alloc_ready_2, iq_mdu_issue;
+    logic iq_lsu_alloc_valid, iq_lsu_alloc_ready, iq_lsu_alloc_ready_2, iq_lsu_issue;
+    logic iq_bru_alloc_valid, iq_bru_alloc_ready, iq_bru_alloc_ready_2, iq_bru_issue;
     logic [ROB_W-1:0] iq_alu_issue_rob, iq_mdu_issue_rob, iq_lsu_issue_rob, iq_bru_issue_rob;
     logic [PRF_W-1:0] iq_alu_issue_pdst, iq_mdu_issue_pdst, iq_lsu_issue_pdst, iq_bru_issue_pdst;
     logic [31:0] iq_alu_issue_op1, iq_alu_issue_op2, iq_alu_issue_imm, iq_alu_issue_pc;
@@ -231,10 +256,12 @@ module student_top import pkg_cpu2026::*; #(
 
     // ================= 派发控制 =================
     logic target_ready;
-    assign target_ready = fd_alu ? iq_alu_alloc_ready :
-                          fd_mul ? iq_mdu_alloc_ready :
-                          fd_lsu ? iq_lsu_alloc_ready :
-                          fd_bru ? iq_bru_alloc_ready : 1'b1;
+    // 在飞分配预留：rn 阶段指令的分配比派发检查晚一拍采样，
+    // 若该指令与当前派发目标同一 IQ，需保证有 2 个空槽（弃置槽位=永久死锁）
+    assign target_ready = fd_alu ? (iq_alu_alloc_ready && (!iq_alu_alloc_valid || iq_alu_alloc_ready_2)) :
+                          fd_mul ? (iq_mdu_alloc_ready && (!iq_mdu_alloc_valid || iq_mdu_alloc_ready_2)) :
+                          fd_lsu ? (iq_lsu_alloc_ready && (!iq_lsu_alloc_valid || iq_lsu_alloc_ready_2)) :
+                          fd_bru ? (iq_bru_alloc_ready && (!iq_bru_alloc_valid || iq_bru_alloc_ready_2)) : 1'b1;
 
     logic ext_ready;
     assign ext_ready = rob_alloc_ready && target_ready && (!fd_store || sb_alloc_ready);
@@ -303,6 +330,7 @@ module student_top import pkg_cpu2026::*; #(
         .alloc_is_jal(fd_dec.is_jal),
         .alloc_is_jalr(fd_dec.is_jalr),
         .alloc_illegal(fd_dec.illegal),
+        .alloc_pd_target(fd_pd_target),
         .next_rob_id(rob_next_id),
         .head_rob_id(rob_head_id),
         .complete_valid(complete_valid),
@@ -322,7 +350,9 @@ module student_top import pkg_cpu2026::*; #(
         .flush_rob_id(flush_rob_id),
         .flush_free_valid(rob_flush_free_valid),
         .flush_free_pdst(rob_flush_free_pdst),
-        .flush_free_done(rob_flush_free_done)
+        .flush_free_done(rob_flush_free_done),
+        .lookup_rob_id(br_r_rob),
+        .lookup_pd_target(rob_lookup_pd_target)
     );
 
     // 被覆盖旧映射：rd 的当前 RAT 映射（组合读 rename 的 rat —— 通过 ps1 取巧不可靠）
@@ -410,7 +440,7 @@ module student_top import pkg_cpu2026::*; #(
     issue_queue #(.IQ_DEPTH(8), .ISSUE_WIDTH(1), .WAKEUP_PORTS(4), .PRF_W(PRF_W), .ROB_ID_W(ROB_W), .OP_W(OP_W))
     u_iq_alu (
         .clk(clock), .reset(reset),
-        .alloc_valid(iq_alu_alloc_valid), .alloc_ready(iq_alu_alloc_ready),
+        .alloc_valid(iq_alu_alloc_valid), .alloc_ready(iq_alu_alloc_ready), .alloc_ready_2(iq_alu_alloc_ready_2),
         .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
         .alloc_has_rs1(d_alu_has1), .alloc_has_rs2(d_alu_has2),
         .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
@@ -432,7 +462,7 @@ module student_top import pkg_cpu2026::*; #(
     issue_queue #(.IQ_DEPTH(8), .ISSUE_WIDTH(1), .WAKEUP_PORTS(4), .PRF_W(PRF_W), .ROB_ID_W(ROB_W), .OP_W(OP_W))
     u_iq_mdu (
         .clk(clock), .reset(reset),
-        .alloc_valid(iq_mdu_alloc_valid), .alloc_ready(iq_mdu_alloc_ready),
+        .alloc_valid(iq_mdu_alloc_valid), .alloc_ready(iq_mdu_alloc_ready), .alloc_ready_2(iq_mdu_alloc_ready_2),
         .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
         .alloc_has_rs1(d_mdu_has1), .alloc_has_rs2(d_mdu_has2),
         .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
@@ -451,10 +481,10 @@ module student_top import pkg_cpu2026::*; #(
         .flush_valid(flush_valid), .flush_rob_id(flush_rob_id)
     );
 
-    issue_queue #(.IQ_DEPTH(8), .ISSUE_WIDTH(1), .WAKEUP_PORTS(4), .PRF_W(PRF_W), .ROB_ID_W(ROB_W), .OP_W(OP_W))
+    issue_queue #(.IQ_DEPTH(8), .ISSUE_WIDTH(1), .WAKEUP_PORTS(4), .PRF_W(PRF_W), .ROB_ID_W(ROB_W), .OP_W(OP_W), .STORE_ORDER(1))
     u_iq_lsu (
         .clk(clock), .reset(reset),
-        .alloc_valid(iq_lsu_alloc_valid), .alloc_ready(iq_lsu_alloc_ready),
+        .alloc_valid(iq_lsu_alloc_valid), .alloc_ready(iq_lsu_alloc_ready), .alloc_ready_2(iq_lsu_alloc_ready_2),
         .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
         .alloc_has_rs1(d_lsu_has1), .alloc_has_rs2(d_lsu_has2),
         .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
@@ -476,7 +506,7 @@ module student_top import pkg_cpu2026::*; #(
     issue_queue #(.IQ_DEPTH(8), .ISSUE_WIDTH(1), .WAKEUP_PORTS(4), .PRF_W(PRF_W), .ROB_ID_W(ROB_W), .OP_W(OP_W))
     u_iq_bru (
         .clk(clock), .reset(reset),
-        .alloc_valid(iq_bru_alloc_valid), .alloc_ready(iq_bru_alloc_ready),
+        .alloc_valid(iq_bru_alloc_valid), .alloc_ready(iq_bru_alloc_ready), .alloc_ready_2(iq_bru_alloc_ready_2),
         .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
         .alloc_has_rs1(d_bru_has1), .alloc_has_rs2(d_bru_has2),
         .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
@@ -674,8 +704,8 @@ module student_top import pkg_cpu2026::*; #(
                     ls_result <= sb_query_data;
                     ls_done_valid <= 1'b1;
                     ls_state <= LS_IDLE;
-                end else begin
-                    ls_state <= LS_WAIT_MEM;   // 本拍已发读请求
+                end else if (lsu_fire) begin
+                    ls_state <= LS_WAIT_MEM;   // 请求真正发出才等待响应
                 end
             end
             LS_WAIT_MEM: begin
@@ -760,17 +790,22 @@ module student_top import pkg_cpu2026::*; #(
             end
         end
     end
-    assign redirect_target = br_r_op[7] ? ((br_r_op1 + br_r_imm) & ~32'h1)
-                                        : (br_r_pc + br_r_imm);
-    // 取指重定向 = 分支跳转 或 store 提交后的重取指
-    assign redirect_fire = (br_r_valid && br_taken && !halted) || store_commit_fire;
-    assign fetch_redirect_target = store_commit_fire ? store_pc_next : redirect_target;
+    // 实际目标：taken 分支/jal → pc+imm；jalr → rs1+imm；not-taken → pc+4
+    logic [31:0] br_actual_target;
+    assign br_actual_target = br_r_op[7] ? ((br_r_op1 + br_r_imm) & ~32'h1)
+                                          : (br_taken ? (br_r_pc + br_r_imm)
+                                                      : (br_r_pc + 32'd4));
+    assign redirect_target = br_actual_target;
+    // 取指重定向 = 分支误预测 或 store 提交后的重取指
+    assign redirect_fire = (br_r_valid && !halted &&
+                            (br_actual_target != rob_lookup_pd_target)) || store_commit_fire;
+    assign fetch_redirect_target = store_commit_fire ? store_pc_next : br_actual_target;
 
-    // flush 广播
+    // flush 广播（仅来自 BRU 误预测；store 提交重取指不触发 flush）
     logic        flush_valid;
     logic [ROB_W-1:0] flush_rob_id;
-    // flush 广播（仅来自 BRU 分支跳转；store 提交重取指不触发 flush）
-    assign flush_valid  = br_r_valid && br_taken && !halted;
+    assign flush_valid  = br_r_valid && !halted &&
+                          (br_actual_target != rob_lookup_pd_target);
     assign flush_rob_id = br_r_rob;
 
     // BRU 写回链接值（jal/jalr 且有 rd：op[4]=1）→ CDB 端口 3
@@ -805,27 +840,24 @@ module student_top import pkg_cpu2026::*; #(
             fetch_pc <= 32'd0;
             fetch_outstanding <= 3'd0;
             drain_cnt <= 3'd0;
-            resp_pc <= 32'd0;
             fq_wptr <= 2'd0; fq_rptr <= 2'd0; fq_cnt <= 3'd0;
             ro_wptr <= 3'd0; ro_rptr <= 3'd0; ro_cnt <= 4'd0;
         end else begin
             if (fetch_fire) begin
-                fetch_pc <= fetch_pc + 32'd4;
-                ro_q[ro_wptr] <= 1'b0;
+                fetch_pc <= predicted_next;          // 按预测前进
+                ro_q[ro_wptr] <= {predicted_next, fetch_pc, 1'b0};
             end
             if (lsu_fire) begin
-                ro_q[ro_wptr] <= 1'b1;
+                ro_q[ro_wptr] <= {32'd0, 32'd0, 1'b1};
             end
             if (fetch_fire || lsu_fire) ro_wptr <= ro_wptr + 3'd1;
             if (rd_resp_valid) ro_rptr <= ro_rptr + 3'd1;
             if (fetch_resp_route) begin
-                fq[fq_wptr] <= {resp_pc, rd_resp_data};
+                fq[fq_wptr] <= {resp_pd_target, resp_pc, rd_resp_data};
                 fq_wptr <= fq_wptr + 2'd1;
-                resp_pc <= resp_pc + 32'd4;
             end
             if (redirect_fire) begin
                 fetch_pc <= fetch_redirect_target;
-                resp_pc <= fetch_redirect_target;
                 // 累加式 drain：支持 drain 期间再次重定向（旧请求计数并入）
                 drain_cnt <= drain_cnt + fetch_outstanding
                            - ((rd_resp_valid && (resp_type == 1'b0)) ? 3'd1 : 3'd0);
@@ -914,6 +946,10 @@ module student_top import pkg_cpu2026::*; #(
                                                cycle_cnt, iq_lsu_issue_rob, iq_lsu_issue_op,
                                                iq_lsu_issue_op1, iq_lsu_issue_op2, iq_lsu_issue_imm);
                     if (iq_bru_issue) $fdisplay(dbg_fd, "[iss-bru] c=%0d rob=%0d", cycle_cnt, iq_bru_issue_rob);
+                    if ((ls_state == LS_WAIT_SB) && sb_query_forward)
+                        $fdisplay(dbg_fd, "[ldf] c=%0d rob=%0d addr=%08h data=%08h", cycle_cnt, ls_rob, ls_addr, sb_query_data);
+                    if ((ls_state == LS_WAIT_SB) && !sb_query_stall && !sb_query_forward && lsu_fire)
+                        $fdisplay(dbg_fd, "[ldm] c=%0d rob=%0d addr=%08h", cycle_cnt, ls_rob, ls_addr);
                 end
             end
         end

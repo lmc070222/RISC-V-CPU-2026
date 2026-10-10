@@ -29,6 +29,7 @@ module rob #(
     input  logic                    alloc_is_jal,
     input  logic                    alloc_is_jalr,
     input  logic                    alloc_illegal,
+    input  logic [31:0]             alloc_pd_target,   // 预测目标（PC+4 或 BTB 目标）
     output logic [ROB_ID_W-1:0]     next_rob_id,     // 尾部指针（组合，给 rename）
     output logic [ROB_ID_W-1:0]     head_rob_id,     // 头部指针（组合，给 IQ 选择基准）
 
@@ -57,7 +58,11 @@ module rob #(
     input  logic [ROB_ID_W-1:0]     flush_rob_id,
     output logic                    flush_free_valid,   // 组合：本拍归还一个 pdst
     output logic [PRF_W-1:0]        flush_free_pdst,
-    output logic                    flush_free_done     // 归还结束（FREE→IDLE）
+    output logic                    flush_free_done,    // 归还结束（FREE→IDLE）
+
+    // 预测目标查找（BRU 误预测判定用）
+    input  logic [ROB_ID_W-1:0]     lookup_rob_id,
+    output logic [31:0]             lookup_pd_target
 );
 
     // ================= 条目（索引 = ROB 号）=================
@@ -73,6 +78,7 @@ module rob #(
     logic                    is_jal    [0:ROB_DEPTH-1];
     logic                    is_jalr   [0:ROB_DEPTH-1];
     logic                    illegal   [0:ROB_DEPTH-1];
+    logic [31:0]             pd_target [0:ROB_DEPTH-1];
 
     logic [ROB_ID_W-1:0] head, tail;
 
@@ -101,6 +107,7 @@ module rob #(
     assign alloc_ready = !reset && !full && (fstate == S_IDLE);
     assign next_rob_id = tail;
     assign head_rob_id = head;
+    assign lookup_pd_target = pd_target[lookup_rob_id];
 
     // ================= 环序 younger 判定 =================
     logic [ROB_ID_W-1:0] flush_diff [0:ROB_DEPTH-1];
@@ -212,6 +219,7 @@ module rob #(
                 is_jal[tail]    <= alloc_is_jal;
                 is_jalr[tail]   <= alloc_is_jalr;
                 illegal[tail]   <= alloc_illegal;
+                pd_target[tail] <= alloc_pd_target;
                 tail <= tail + ROB_ID_W'(1);
             end
             // 3) 提交推进

@@ -47,6 +47,10 @@ module mdu import pkg_cpu2026::*; #(
     assign mul_res = (mul_type_l == MUL_MUL) ? mul_wide[31:0] : mul_wide[63:32];
 
     // ---- 除法迭代（恢复法：r/q 组成 65 位移位寄存器）----
+    // 仅带符号除法(DIV/REM)需要取绝对值参与迭代；DIVU/REMU 直接用原码，
+    // 且结果不经过符号调整。
+    logic        is_signed_div;
+    assign is_signed_div = (div_type == DIV_DIV) || (div_type == DIV_REM);
     logic [32:0] rem_shifted, rem_sub;
     logic        sub;
     assign rem_shifted = {rem[31:0], quot[31]};
@@ -86,11 +90,11 @@ module mdu import pkg_cpu2026::*; #(
                 div_type_l <= div_type;
                 a_l <= a;
                 b_l <= b;
-                neg_a <= a[31];
-                neg_b <= b[31];
-                mag_a <= a[31] ? (~a + 32'd1) : a;
-                mag_b <= b[31] ? (~b + 32'd1) : b;
-                quot <= a[31] ? (~a + 32'd1) : a;
+                neg_a <= a[31] && is_signed_div;
+                neg_b <= b[31] && is_signed_div;
+                mag_a <= (a[31] && is_signed_div) ? (~a + 32'd1) : a;
+                mag_b <= (b[31] && is_signed_div) ? (~b + 32'd1) : b;
+                quot <= (a[31] && is_signed_div) ? (~a + 32'd1) : a;
                 rem  <= 33'd0;
                 iter <= 6'd0;
             end else if (running) begin

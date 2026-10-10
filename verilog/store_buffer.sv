@@ -9,7 +9,8 @@
 // 时序：alloc/fill/commit/flush/wr_resp 于 cycle N → 边沿 N+1；query 为纯组合。
 module store_buffer #(
     parameter int SB_DEPTH = 8,
-    parameter int ROB_ID_W = 4
+    parameter int ROB_ID_W = 4,
+    parameter logic DEBUG  = 0
 ) (
     input  logic clk,
     input  logic reset,
@@ -146,6 +147,26 @@ module store_buffer #(
         end
     end
 
+`ifndef SYNTHESIS
+    integer dbg_cyc = 0;
+    if (DEBUG) begin : g_dbg
+        always @(posedge clk) begin
+            dbg_cyc <= dbg_cyc + 1;
+            if (!reset && query_valid && (query_addr == 32'h3ffd4)) begin
+                $display("[sb-q] c=%0d qrob=%0d qaddr=%08h stall=%b fwd=%b head=%0d tail=%0d hrob=%0d",
+                         dbg_cyc, query_rob_id, query_addr, query_stall, query_forward, head, tail, head_rob_id);
+                for (int j = 0; j < SB_DEPTH; j++) begin
+                    if (valid[j])
+                        $display("  q j=%0d rob=%0d v=%b c=%b av=%b dv=%b addr=%08h eage=%0d qage=%0d",
+                                 j, rob_id[j], valid[j], committed[j],
+                                 addr_valid[j], data_valid[j], addr[j],
+                                 rob_id[j] - head_rob_id, query_rob_id - head_rob_id);
+                end
+            end
+        end
+    end
+`endif
+
     // ================= 条目更新（单块）=================
     always_ff @(posedge clk) begin
         if (reset) begin
@@ -164,10 +185,16 @@ module store_buffer #(
                 (is_exit[head] ? exit_ack : wr_resp_valid)) begin
                 valid[head] <= 1'b0;
                 head <= head + ROB_ID_W'(1);
+`ifndef SYNTHESIS
+                if (DEBUG) $display("[sb-rel] c=%0d head=%0d rob=%0d", dbg_cyc, head, rob_id[head]);
+`endif
             end
             // 2) 写发出：head committed 且未发 → 握手 fire
             if (wr_req_valid && wr_req_ready) begin
                 wr_sent[head] <= 1'b1;
+`ifndef SYNTHESIS
+                if (DEBUG) $display("[sb-wr] c=%0d head=%0d rob=%0d addr=%08h data=%08h strb=%b", dbg_cyc, head, rob_id[head], addr[head], data[head], wstrb[head]);
+`endif
             end
             // 3) 分配
             if (alloc_valid && alloc_ready) begin
@@ -179,10 +206,11 @@ module store_buffer #(
                 rob_id[tail]     <= alloc_rob_id;
                 tail <= tail + ROB_ID_W'(1);
             end
-            // 4) 执行回填
+            // 4) 执行回填：只匹配未提交条目——rob 号回绕后，已提交的滞留条目
+            //    可能与新一代在飞条目同号，误匹配会覆写其地址/数据（写串地址）
             if (fill_valid) begin
                 for (int i = 0; i < SB_DEPTH; i++) begin
-                    if (valid[i] && (rob_id[i] == fill_rob_id)) begin
+                    if (valid[i] && !committed[i] && (rob_id[i] == fill_rob_id)) begin
                         addr[i]       <= fill_addr;
                         data[i]       <= fill_data;
                         wstrb[i]      <= fill_wstrb;
@@ -192,31 +220,45 @@ module store_buffer #(
                     end
                 end
             end
-            // 5) 提交
+            // 5) 提交：只匹配未提交条目（同上，防跨代误提交）
             if (commit_valid) begin
                 for (int i = 0; i < SB_DEPTH; i++) begin
-                    if (valid[i] && (rob_id[i] == commit_rob_id)) begin
+                    if (valid[i] && !committed[i] && (rob_id[i] == commit_rob_id)) begin
                         committed[i] <= 1'b1;
                     end
                 end
             end
             // 6) flush：清年轻条目（窗口内：age_f < entry_age < tail_age）+ tail 回退
+            //    只清未提交条目——已提交条目（写可能已在飞）绝不能被冲掉，
+            //    否则其槽位永远无法释放（头指针卡死）且写响应无家可归
             if (flush_valid) begin
                 logic [$clog2(SB_DEPTH)-1:0] cnt;
                 cnt = '0;
                 for (int i = 0; i < SB_DEPTH; i++) begin
                     logic [ROB_ID_W-1:0] e_age;
                     e_age = rob_id[i] - head_rob_id;
-                    if (valid[i] && (e_age > sb_flush_age) && (e_age < sb_tail_age)) begin
+                    if (valid[i] && !committed[i] && (e_age > sb_flush_age) && (e_age < sb_tail_age)) begin
                         valid[i] <= 1'b0;
                         cnt = cnt + $clog2(SB_DEPTH)'(1);
                     end
                 end
                 tail <= tail - ROB_ID_W'(cnt);
-                if (valid[head] && ((rob_id[head] - head_rob_id) > sb_flush_age) &&
+                if (valid[head] && !committed[head] &&
+                    ((rob_id[head] - head_rob_id) > sb_flush_age) &&
                     ((rob_id[head] - head_rob_id) < sb_tail_age)) begin
                     head <= tail - ROB_ID_W'(cnt);
                 end
+`ifndef SYNTHESIS
+                if (DEBUG) begin
+                    $display("[sb-flush] c=%0d flushrob=%0d hrob=%0d trob=%0d head=%0d tail=%0d cnt=%0d",
+                             dbg_cyc, flush_rob_id, head_rob_id, tail_rob_id, head, tail, cnt);
+                    for (int j = 0; j < SB_DEPTH; j++)
+                        if (valid[j])
+                            $display("  pre j=%0d rob=%0d v=%b c=%b av=%b dv=%b ws=%b",
+                                     j, rob_id[j], valid[j], committed[j], addr_valid[j],
+                                     data_valid[j], wr_sent[j]);
+                end
+`endif
             end
         end
     end

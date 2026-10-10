@@ -154,8 +154,9 @@ module issue_queue #(
                     end
                 end
             end
-            // 4) 入队（最后写：free 槽 valid=0，与弹出/flush 槽位不同）
-            if (alloc_valid && alloc_ready) begin
+            // 4) 入队（最后写：free 槽 valid=0，与弹出/flush 槽位不同；
+            //    flush 当拍禁止入队，防止新条目逃过清除）
+            if (alloc_valid && alloc_ready && !flush_valid) begin
                 valid[free_idx]     <= 1'b1;
                 rob_id[free_idx]    <= alloc_rob_id;
                 pdst[free_idx]      <= alloc_pdst;

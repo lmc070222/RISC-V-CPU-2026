@@ -137,10 +137,12 @@ module rename import pkg_cpu2026::*; #(
                 fl_stack[i] <= PRF_W'((PRF_NUM - ARCH_NUM - 1) - i + ARCH_NUM);
             fl_top <= PRF_NUM - ARCH_NUM;
         end else begin
+            // 同拍 push 复用被 pop 腾出的槽（fl_top - pop），避免旧值残留
             if (push_commit)
-                fl_stack[fl_top] <= commit_free_pdst;
+                fl_stack[fl_top - ($clog2(PRF_NUM+1))'(pop_alloc)] <= commit_free_pdst;
             if (push_flush)
-                fl_stack[fl_top + ($clog2(PRF_NUM+1))'(push_commit)] <= flush_free_pdst;
+                fl_stack[fl_top - ($clog2(PRF_NUM+1))'(pop_alloc)
+                         + ($clog2(PRF_NUM+1))'(push_commit)] <= flush_free_pdst;
             fl_top <= fl_top
                     + ($clog2(PRF_NUM+1))'(push_commit)
                     + ($clog2(PRF_NUM+1))'(push_flush)

@@ -9,7 +9,7 @@
 module student_top import pkg_cpu2026::*; #(
     parameter int FETCH_DEPTH = 4,
     parameter int FIFO_DEPTH  = 4,
-    parameter int DBG         = 2
+    parameter int DBG         = 0
 ) (
     input  logic        clock,
     input  logic        reset,
@@ -68,11 +68,11 @@ module student_top import pkg_cpu2026::*; #(
         .rd_resp_ready(rd_resp_ready),
         .rd_resp_data (rd_resp_data),
         .rd_resp_err  (rd_resp_err),
-        .wr_req_valid (wr_req_valid),
-        .wr_req_ready (wr_req_ready),
-        .wr_req_addr  (wr_req_addr),
-        .wr_req_data  (wr_req_data),
-        .wr_req_strb  (wr_req_strb),
+        .wr_req_valid (dc_wr_req_valid),
+        .wr_req_ready (dc_wr_req_ready),
+        .wr_req_addr  (dc_wr_req_addr),
+        .wr_req_data  (dc_wr_req_data),
+        .wr_req_strb  (dc_wr_req_strb),
         .wr_resp_valid(wr_resp_valid),
         .wr_resp_ready(wr_resp_ready),
         .wr_resp_err  (wr_resp_err),
@@ -97,7 +97,16 @@ module student_top import pkg_cpu2026::*; #(
     logic [2:0]  ro_wptr, ro_rptr;
     logic [3:0]  ro_cnt;
 
-    logic lsu_req_valid, lsu_fire, lsu_rd_resp;
+    // D-cache 接口
+    logic        dc_ld_req, dc_ld_ready, dc_ld_hit;
+    logic [31:0] dc_ld_addr, dc_ld_data;
+    logic        dc_st_accept, dc_st_cache_done, dc_st_b_done;
+    logic        sb_store_done;
+    logic        dc_rd_req, dc_rd_ready, dc_resp_valid;
+    logic [31:0] dc_rd_addr;
+    logic        dc_wr_req_valid, dc_wr_req_ready;
+    logic [31:0] dc_wr_req_addr, dc_wr_req_data;
+    logic [3:0]  dc_wr_req_strb;
 
     // I-cache fetch 查询流水（1 拍）
     logic [31:0] lf_pc, lf_pd;
@@ -162,14 +171,14 @@ module student_top import pkg_cpu2026::*; #(
         end
     end
 
-    // 读端口仲裁：LSU 优先，I-cache 重填让位；在飞类型记入 ro_q 供响应路由
-    assign rd_req_valid = lsu_req_valid || ic_rd_req;
-    assign rd_req_addr  = lsu_req_valid ? lsu_addr : ic_rd_addr;
-    assign ic_rd_ready  = rd_req_ready && !lsu_req_valid;
-    assign lsu_fire     = lsu_req_valid && rd_req_ready;
+    // 读端口仲裁：D-cache 重填优先，I-cache 重填让位；在飞类型记入 ro_q 供响应路由
+    assign rd_req_valid = dc_rd_req || ic_rd_req;
+    assign rd_req_addr  = dc_rd_req ? dc_rd_addr : ic_rd_addr;
+    assign dc_rd_ready  = rd_req_ready;
+    assign ic_rd_ready  = rd_req_ready && !dc_rd_req;
     assign ic_resp_valid = rd_resp_valid && (ro_type[ro_rptr] == 1'b0);
+    assign dc_resp_valid = rd_resp_valid && (ro_type[ro_rptr] == 1'b1);
     assign ic_resp_data  = rd_resp_data;
-    assign lsu_rd_resp   = rd_resp_valid && (ro_type[ro_rptr] == 1'b1);
 
     // ================= 派发 =================
     logic [31:0] fd_pc, fd_instr, fd_pd_target;
@@ -377,11 +386,11 @@ module student_top import pkg_cpu2026::*; #(
         .commit_valid(sb_commit_valid),
         .commit_rob_id(sb_commit_rob_id),
         .wr_req_valid(wr_req_valid),
-        .wr_req_ready(wr_req_ready),
+        .wr_req_ready(dc_st_accept),
         .wr_req_addr(wr_req_addr),
         .wr_req_data(wr_req_data),
         .wr_req_strb(wr_req_strb),
-        .wr_resp_valid(wr_resp_valid),
+        .wr_resp_valid(sb_store_done),
         .exit_ack(exit_ack),
         .query_valid(sb_query_valid),
         .query_rob_id(sb_query_rob_id),
@@ -398,6 +407,25 @@ module student_top import pkg_cpu2026::*; #(
 
     assign sb_commit_valid = rob_commit_valid && rob_commit_mask && rob_commit_is_store;
     assign sb_commit_rob_id = rob_commit_rob_id;
+
+    // ================= D-cache =================
+    assign sb_store_done = dc_st_cache_done | dc_st_b_done;
+
+    dcache #(.LINES(64), .LINE_WORDS(8), .MAXOUT(4)) u_dcache (
+        .clk(clock), .reset(reset),
+        .ld_req(dc_ld_req), .ld_addr(dc_ld_addr), .ld_ready(dc_ld_ready),
+        .ld_hit(dc_ld_hit), .ld_data(dc_ld_data),
+        .st_req(wr_req_valid), .st_addr(wr_req_addr), .st_data(wr_req_data),
+        .st_strb(wr_req_strb),
+        .st_is_exit((wr_req_addr == 32'h80000000) && (wr_req_strb == 4'hf)),
+        .st_accept(dc_st_accept), .st_cache_done(dc_st_cache_done), .st_b_done(dc_st_b_done),
+        .rd_req(dc_rd_req), .rd_ready(dc_rd_ready), .rd_addr(dc_rd_addr),
+        .resp_valid(dc_resp_valid), .resp_data(rd_resp_data),
+        .wr_req_valid(dc_wr_req_valid), .wr_req_ready(dc_wr_req_ready),
+        .wr_req_addr(dc_wr_req_addr), .wr_req_data(dc_wr_req_data),
+        .wr_req_strb(dc_wr_req_strb),
+        .wr_resp_valid(wr_resp_valid)
+    );
 
     // ================= 分派 op 编码与操作数（cycle N+1，基于 rn_dec）=================
     logic [OP_W-1:0] d_alu_op, d_mdu_op, d_lsu_op, d_bru_op;
@@ -619,7 +647,7 @@ module student_top import pkg_cpu2026::*; #(
     assign cdb_data[1]   = mdu_result;
 
     // ================= LSU FU =================
-    typedef enum logic [1:0] {LS_IDLE, LS_STORE, LS_WAIT_SB, LS_WAIT_MEM} ls_state_t;
+    typedef enum logic [1:0] {LS_IDLE, LS_STORE, LS_WAIT_SB, LS_LD} ls_state_t;
     ls_state_t ls_state;
     logic [ROB_W-1:0] ls_rob;
     logic [PRF_W-1:0] ls_pdst;
@@ -627,28 +655,21 @@ module student_top import pkg_cpu2026::*; #(
     logic [31:0] ls_addr, ls_data, ls_result;
     logic        ls_done_valid;   // 单拍：load 结果/ store 完成
     logic        ls_is_load;
+    logic        ls_ld_go;        // 已向 D-cache 发起查询，等下一拍结果
 
-    logic [31:0] lsu_addr;   // 读请求地址（与 fetch 仲裁）
-    assign lsu_addr = ls_addr;
-
-    // load 读请求：WAIT_SB 且不 stall 且不 forward → 发请求（flush 当拍不发，避免无主在飞请求）
-    assign lsu_req_valid = !reset && !halted && !flush_valid &&
-                           (ls_state == LS_WAIT_SB) && ls_is_load &&
-                           !sb_query_stall && !sb_query_forward;
     assign sb_query_valid = (ls_state == LS_WAIT_SB) && ls_is_load;
     assign sb_query_rob_id = ls_rob;
     assign sb_query_addr = ls_addr;
     assign sb_query_size = (ls_op[5:3] == LD_LW)  ? 2'd2 :
                            (ls_op[5:3] == LD_LH || ls_op[5:3] == LD_LHU) ? 2'd1 : 2'd0;
 
-    // 响应路由：load 响应到达且 LSU 在等待（丢弃计数为 0 才认为是本 load 的响应）
-    logic load_resp_route;
-    assign load_resp_route = lsu_rd_resp && (lsu_drain == 4'd0) &&
-                             (ls_state == LS_WAIT_MEM) && ls_is_load;
+    // D-cache load 查询（LS_LD 状态；握手后一拍取样结果）
+    assign dc_ld_req   = !reset && !halted && (ls_state == LS_LD) && !ls_ld_go;
+    assign dc_ld_addr  = ls_addr;
 
-    // load 数据字节提取 + 符号扩展
+    // load 数据字节提取 + 符号扩展（数据来自 D-cache）
     logic [31:0] ls_word;
-    assign ls_word = rd_resp_data;
+    assign ls_word = dc_ld_data;
     logic [31:0] ls_extracted;
     always_comb begin
         unique case (ls_op[5:3])
@@ -661,33 +682,19 @@ module student_top import pkg_cpu2026::*; #(
     end
 
     // store 掩码与数据移位（store 编码：op[7]=1, op[4:3]=st_type）
+    // 数据须按字节车道对齐（左移 8×字节偏移位），配合 wstrb 做字节掩码合并
     logic [4:0] ls_shift;
     logic [3:0] ls_strb;
     always_comb begin
         if (ls_op[4:3] == ST_SB) begin
             ls_strb = 4'b0001 << ls_addr[1:0];
-            ls_shift = {3'b0, ls_addr[1:0]};
+            ls_shift = {ls_addr[1:0], 3'b000};
         end else if (ls_op[4:3] == ST_SH) begin
             ls_strb = ls_addr[1] ? 4'b1100 : 4'b0011;
-            ls_shift = {4'b0, ls_addr[1]};
+            ls_shift = {ls_addr[1], 4'b0000};
         end else begin
             ls_strb = 4'hF;
             ls_shift = 5'd0;
-        end
-    end
-
-    // LSU 在飞请求丢弃计数：被冲刷的投机 load 请求已在途，其响应先到；
-// 吞掉这些响应，避免误配给下一笔真实 load（响应按序返回，drain 先于当前响应归零）
-    logic [3:0] lsu_drain;
-    always_ff @(posedge clock) begin
-        if (reset) begin
-            lsu_drain <= 4'd0;
-        end else begin
-            if (flush_valid && (ls_state == LS_WAIT_MEM) &&
-                is_younger(ls_rob, flush_rob_id) && !lsu_rd_resp)
-                lsu_drain <= lsu_drain + 4'd1;
-            else if (lsu_rd_resp && (lsu_drain != 4'd0))
-                lsu_drain <= lsu_drain - 4'd1;
         end
     end
 
@@ -695,6 +702,7 @@ module student_top import pkg_cpu2026::*; #(
         if (reset) begin
             ls_state <= LS_IDLE;
             ls_done_valid <= 1'b0;
+            ls_ld_go <= 1'b0;
         end else begin
             ls_done_valid <= 1'b0;
             unique case (ls_state)
@@ -720,24 +728,32 @@ module student_top import pkg_cpu2026::*; #(
                     ls_result <= sb_query_data;
                     ls_done_valid <= 1'b1;
                     ls_state <= LS_IDLE;
-                end else if (lsu_fire) begin
-                    ls_state <= LS_WAIT_MEM;   // 请求真正发出才等待响应
+                end else begin
+                    ls_state <= LS_LD;     // 转 D-cache 查询
+                    ls_ld_go <= 1'b0;
                 end
             end
-            LS_WAIT_MEM: begin
-                if (load_resp_route) begin
-                    ls_result <= ls_extracted;
-                    ls_done_valid <= 1'b1;
-                    ls_state <= LS_IDLE;
+            LS_LD: begin
+                if (!ls_ld_go) begin
+                    if (dc_ld_ready) ls_ld_go <= 1'b1;   // 握手，下一拍取样
+                end else begin
+                    if (dc_ld_hit) begin
+                        ls_result <= ls_extracted;
+                        ls_done_valid <= 1'b1;
+                        ls_state <= LS_IDLE;
+                        ls_ld_go <= 1'b0;
+                    end else begin
+                        ls_ld_go <= 1'b0;   // 缺失：D-cache 重填后重试
+                    end
                 end
             end
             default: ls_state <= LS_IDLE;
             endcase
-            // flush 在飞 load/store（读请求已发出则计入 drain 由响应路径吞掉；
-            // 同时清掉可能残留的 done 写回）
+            // flush 在飞 load/store（清掉可能残留的 done 写回）
             if (flush_valid && (ls_state != LS_IDLE) && is_younger(ls_rob, flush_rob_id)) begin
                 ls_state <= LS_IDLE;
                 ls_done_valid <= 1'b0;
+                ls_ld_go <= 1'b0;
             end
         end
     end
@@ -898,10 +914,10 @@ module student_top import pkg_cpu2026::*; #(
                 if (fq_pop) fq_rptr <= fq_rptr + 2'd1;
             end
             if (ic_rd_req && ic_rd_ready) ro_type[ro_wptr] <= 1'b0;
-            if (lsu_fire)                ro_type[ro_wptr] <= 1'b1;
-            if ((ic_rd_req && ic_rd_ready) || lsu_fire) ro_wptr <= ro_wptr + 3'd1;
+            if (dc_rd_req && dc_rd_ready) ro_type[ro_wptr] <= 1'b1;
+            if ((ic_rd_req && ic_rd_ready) || (dc_rd_req && dc_rd_ready)) ro_wptr <= ro_wptr + 3'd1;
             if (rd_resp_valid) ro_rptr <= ro_rptr + 3'd1;
-            ro_cnt <= ro_cnt + (((ic_rd_req && ic_rd_ready) || lsu_fire) ? 4'd1 : 4'd0)
+            ro_cnt <= ro_cnt + (((ic_rd_req && ic_rd_ready) || (dc_rd_req && dc_rd_ready)) ? 4'd1 : 4'd0)
                               - (rd_resp_valid ? 4'd1 : 4'd0);
         end
     end
@@ -969,11 +985,14 @@ module student_top import pkg_cpu2026::*; #(
                     if (iq_lsu_issue) $fdisplay(dbg_fd, "[iss-lsu] c=%0d rob=%0d op=%02h op1=%08h op2=%08h imm=%08h",
                                                cycle_cnt, iq_lsu_issue_rob, iq_lsu_issue_op,
                                                iq_lsu_issue_op1, iq_lsu_issue_op2, iq_lsu_issue_imm);
-                    if (iq_bru_issue) $fdisplay(dbg_fd, "[iss-bru] c=%0d rob=%0d", cycle_cnt, iq_bru_issue_rob);
+                    if (iq_bru_issue) $fdisplay(dbg_fd, "[iss-bru] c=%0d rob=%0d op1=%08h op2=%08h imm=%08h op=%02h pc=%08h",
+                                                cycle_cnt, iq_bru_issue_rob, iq_bru_issue_op1,
+                                                iq_bru_issue_op2, iq_bru_issue_imm, iq_bru_issue_op,
+                                                iq_bru_issue_pc);
                     if ((ls_state == LS_WAIT_SB) && sb_query_forward)
                         $fdisplay(dbg_fd, "[ldf] c=%0d rob=%0d addr=%08h data=%08h", cycle_cnt, ls_rob, ls_addr, sb_query_data);
-                    if ((ls_state == LS_WAIT_SB) && !sb_query_stall && !sb_query_forward && lsu_fire)
-                        $fdisplay(dbg_fd, "[ldm] c=%0d rob=%0d addr=%08h", cycle_cnt, ls_rob, ls_addr);
+                    if ((ls_state == LS_LD) && ls_ld_go && dc_ld_hit)
+                        $fdisplay(dbg_fd, "[ldc] c=%0d rob=%0d addr=%08h data=%08h", cycle_cnt, ls_rob, ls_addr, dc_ld_data);
                 end
             end
         end

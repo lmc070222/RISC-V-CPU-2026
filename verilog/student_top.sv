@@ -316,7 +316,7 @@ module student_top import pkg_cpu2026::*; #(
                                  : (rob_alloc_ready && target_ready && (!fd_store || sb_alloc_ready));
 
     assign disp_valid = !reset && !halted && (fq_cnt != 3'd0) && !flush_valid && !illegal_halt;
-    localparam bit PAIR_EN = 1'b0;   // 成对派发开关（调试中；单派发已验证 18/19）
+    localparam bit PAIR_EN = 1'b1;   // 成对派发开关
     assign disp_pair  = PAIR_EN && disp_valid && (fq_cnt >= 3'd2) && pair_instr_ok;
 
     rename #(.WB_PORTS(4), .ROB_DEPTH(16), .ROB_ID_W(ROB_W)) u_rename (
@@ -643,7 +643,7 @@ module student_top import pkg_cpu2026::*; #(
         .alloc_s1_ready(mdu_s1r), .alloc_s2_ready(mdu_s2r),
         .alloc_s1_data(mdu_s1d), .alloc_s2_data(mdu_s2d),
         .alloc_imm(32'd0), .alloc_use_imm(1'b0),
-        .alloc_pc(32'd0), .alloc_op(d_mdu_op),
+        .alloc_pc(32'd0), .alloc_op(mdu_op),
         .wakeup_valid(cdb_valid), .wakeup_tag(cdb_pdst), .wakeup_data(cdb_data),
         .head_rob_id(rob_head_id),
         .issue_block(mdu_busy),
@@ -1131,9 +1131,6 @@ module student_top import pkg_cpu2026::*; #(
                               cycle_cnt, rob_commit_rob_id[0], rob_commit_pc[0],
                               rob_commit_has_rd[0], rob_commit_old_pdst[0], rob_commit_is_store[0],
                               sb_commit_valid);
-                if (rob_commit_valid && rob_commit_mask[1])
-                    $fdisplay(dbg_fd, "[commit1] c=%0d rob=%0d pc=%08h", cycle_cnt,
-                              rob_commit_rob_id[1], rob_commit_pc[1]);
                 if (flush_valid)
                     $fdisplay(dbg_fd, "[flush] c=%0d rob=%0d target=%08h pred=%08h brpc=%08h head=%0d tail=%0d",
                               cycle_cnt, flush_rob_id, redirect_target, rob_lookup_pd_target,

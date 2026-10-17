@@ -157,11 +157,18 @@ module dcache #(
 
     // ---- 对外输出 ----
     // early restart：重填中 load 所需字一到即完成（不等整行），省去后续字的等待
+    // 地址匹配防护：被 flush 的投机 load 之后的新 load 不得抢到旧重填行的数据
     logic        early_pend;
     logic [31:0] early_data;
-    wire early_fire = (state == D_REF) && resp_valid && (r_done == get_word(q_addr)) && !early_pend;
+    logic [TAG_W+IDX_W-1:0] early_line;   // 旧行的 {tag, idx}
+    logic [OFF_W-1:0]       early_word;
+    wire early_line_ok = (ld_addr[31:OFF_W+2] == q_addr[31:OFF_W+2]);
+    wire early_fire = (state == D_REF) && resp_valid && !early_pend && ld_req &&
+                      (r_done == get_word(q_addr)) && early_line_ok &&
+                      (get_word(ld_addr) == get_word(q_addr));
     assign ld_ready  = !reset && ((state == D_IDLE) || early_fire);
-    assign ld_hit    = early_pend ||
+    assign ld_hit    = (early_pend && (ld_addr[31:OFF_W+2] == early_line) &&
+                        (get_word(ld_addr) == early_word)) ||
                        ((state == D_LD) && valid[q_idx] && (tag_rdata == get_tag(q_addr)));
     assign ld_data   = early_pend ? early_data : data_rdata;
     assign st_accept = !reset && (state == D_IDLE) && st_req && !ld_req && !st_to_axi;
@@ -202,6 +209,8 @@ module dcache #(
             if (early_fire) begin
                 early_pend <= 1'b1;
                 early_data <= resp_data;
+                early_line <= q_addr[31:OFF_W+2];
+                early_word <= get_word(q_addr);
             end else if (early_pend) begin
                 early_pend <= 1'b0;
             end

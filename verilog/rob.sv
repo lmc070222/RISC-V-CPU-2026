@@ -16,20 +16,21 @@ module rob #(
     input  logic clk,
     input  logic reset,
 
-    // ---- 分配（来自 rename）----
-    input  logic                    alloc_valid,
+    // ---- 分配（来自 rename，2 宽）----
+    input  logic [1:0]              alloc_valid,
     output logic                    alloc_ready,     // 组合（满 / FREE 归还中则 0）
-    input  logic [31:0]             alloc_pc,
-    input  logic [4:0]              alloc_arch_rd,
-    input  logic                    alloc_has_rd,
-    input  logic [PRF_W-1:0]        alloc_pdst,
-    input  logic [PRF_W-1:0]        alloc_old_pdst,
-    input  logic                    alloc_is_store,
-    input  logic                    alloc_is_branch,
-    input  logic                    alloc_is_jal,
-    input  logic                    alloc_is_jalr,
-    input  logic                    alloc_illegal,
-    input  logic [31:0]             alloc_pd_target,   // 预测目标（PC+4 或 BTB 目标）
+    output logic                    alloc_ready_2,   // 可接收成对分配
+    input  logic [1:0][31:0]        alloc_pc,
+    input  logic [1:0][4:0]         alloc_arch_rd,
+    input  logic [1:0]              alloc_has_rd,
+    input  logic [1:0][PRF_W-1:0]   alloc_pdst,
+    input  logic [1:0][PRF_W-1:0]   alloc_old_pdst,
+    input  logic [1:0]              alloc_is_store,
+    input  logic [1:0]              alloc_is_branch,
+    input  logic [1:0]              alloc_is_jal,
+    input  logic [1:0]              alloc_is_jalr,
+    input  logic [1:0]              alloc_illegal,
+    input  logic [1:0][31:0]        alloc_pd_target,   // 预测目标（PC+4 或 BTB 目标）
     output logic [ROB_ID_W-1:0]     next_rob_id,     // 尾部指针（组合，给 rename）
     output logic [ROB_ID_W-1:0]     head_rob_id,     // 头部指针（组合，给 IQ 选择基准）
 
@@ -48,10 +49,10 @@ module rob #(
     output logic [COMMIT_WIDTH-1:0][31:0]         commit_pc,
 
     // 延迟释放：checkpoint 恢复可能复活旧物理寄存器，故提交的旧 pdst 只在
-    // 没有未解析分支时才归还空闲列表
-    output logic                    commit_free_valid,
-    output logic [PRF_W-1:0]        commit_free_pdst,
-    input  logic                    commit_free_taken,   // rename 实际接收（未被跳过）
+    // 没有未解析分支时才归还空闲列表（双通道）
+    output logic [1:0]              commit_free_valid,
+    output logic [1:0][PRF_W-1:0]   commit_free_pdst,
+    input  logic [1:0]              commit_free_taken,   // rename 实际接收（未被跳过）
 
     // ---- flush ----
     input  logic                    flush_valid,
@@ -84,13 +85,18 @@ module rob #(
 
     // ================= 延迟释放队列 =================
     logic [$clog2(ROB_DEPTH+1)-1:0] unresolved_cnt;   // 在飞未解析分支数
-    logic [PRF_W-1:0]              pend_q [0:ROB_DEPTH-1];
-    logic [$clog2(ROB_DEPTH+1)-1:0] pend_wptr, pend_rptr, pend_cnt;
+    logic [PRF_W-1:0]              pend_q [0:2*ROB_DEPTH-1];
+    logic [$clog2(2*ROB_DEPTH)-1:0]   pend_wptr, pend_rptr;   // 回绕模 2*ROB_DEPTH
+    logic [$clog2(2*ROB_DEPTH+1)-1:0] pend_cnt;
 
-    logic pend_push;
-    assign pend_push = commit_valid && commit_has_rd;
-    assign commit_free_valid = !reset && (unresolved_cnt == '0) && (pend_cnt != '0);
-    assign commit_free_pdst  = pend_q[pend_rptr];
+    logic pend_push0, pend_push1;
+    assign pend_push0 = commit_mask[0] && commit_has_rd[0];
+    assign pend_push1 = (COMMIT_WIDTH > 1) && commit_mask[1] && commit_has_rd[1];
+    assign commit_free_valid[0] = !reset && (unresolved_cnt == '0) && (pend_cnt != '0);
+    assign commit_free_valid[1] = !reset && (unresolved_cnt == '0) && (pend_cnt >= 2) &&
+                                  commit_free_valid[0] && commit_free_taken[0];
+    assign commit_free_pdst[0]  = pend_q[pend_rptr];
+    assign commit_free_pdst[1]  = pend_q[pend_rptr + $clog2(2*ROB_DEPTH)'(1)];
 
     // ================= FREE 状态机（flush 逐拍归还）=================
     typedef enum logic {S_IDLE, S_FREE} fstate_t;
@@ -102,9 +108,11 @@ module rob #(
     assign flush_free_done  = (fstate == S_FREE) && (free_ptr == free_end);
 
     // ================= 环序与满 =================
-    logic full;
-    assign full = valid[(tail + ROB_ID_W'(1)) % ROB_DEPTH];
-    assign alloc_ready = !reset && !full && (fstate == S_IDLE);
+    logic full1, full2;
+    assign full1 = valid[(tail + ROB_ID_W'(1)) % ROB_DEPTH];
+    assign full2 = valid[(tail + ROB_ID_W'(2)) % ROB_DEPTH];
+    assign alloc_ready   = !reset && !full1 && (fstate == S_IDLE);
+    assign alloc_ready_2 = !reset && !full2 && (fstate == S_IDLE);
     assign next_rob_id = tail;
     assign head_rob_id = head;
     assign lookup_pd_target = pd_target[lookup_rob_id];
@@ -122,6 +130,10 @@ module rob #(
     logic                    commit_valid_c;
     logic [ROB_ID_W-1:0]     commit_cnt_c;
 
+    // pending 释放队列水位反压：环深 32，本拍最多 2 新推 + 2 轮转；
+    // 余量不足时暂停提交，防止环溢出（会造成释放列表注入重复/垃圾项）
+    wire commit_gate = (pend_cnt <= ($clog2(2*ROB_DEPTH+1))'(28));
+
     always_comb begin
         commit_mask_c = '0;
         commit_valid_c = 1'b0;
@@ -130,7 +142,7 @@ module rob #(
             logic [ROB_ID_W-1:0] idx;
             logic ok;
             idx = (head + ROB_ID_W'(i)) % ROB_DEPTH;
-            if (i == 0) ok = valid[idx] && done[idx];
+            if (i == 0) ok = commit_gate && valid[idx] && done[idx];
             else        ok = commit_mask_c[i-1] && valid[idx] && done[idx];
             commit_mask_c[i] = ok;
             commit_valid_c |= ok;
@@ -153,14 +165,18 @@ module rob #(
     end
 
     // ================= 条目更新（单块）=================
-    logic uc_alloc_inc, uc_complete_dec;
+    logic [$clog2(ROB_DEPTH+1)-1:0] uc_alloc_inc;
+    logic uc_complete_dec;
     logic [$clog2(ROB_DEPTH+1)-1:0] uc_flush_dec;
     logic [$clog2(ROB_DEPTH+1)-1:0] uc_complete_dec_w;
 
     always_comb begin
         uc_alloc_inc = 1'b0;
-        if (alloc_valid && alloc_ready &&
-            (alloc_is_branch || alloc_is_jal || alloc_is_jalr)) uc_alloc_inc = 1'b1;
+        if (alloc_valid[0] && alloc_ready &&
+            (alloc_is_branch[0] || alloc_is_jal[0] || alloc_is_jalr[0])) uc_alloc_inc = 1'b1;
+        if (alloc_valid[1] && alloc_valid[0] && alloc_ready_2 &&
+            (alloc_is_branch[1] || alloc_is_jal[1] || alloc_is_jalr[1]))
+            uc_alloc_inc = uc_alloc_inc + $clog2(ROB_DEPTH+1)'(1);
         uc_complete_dec = 1'b0;
         uc_complete_dec_w = '0;
         for (int j = 0; j < WB_PORTS; j++) begin
@@ -205,22 +221,39 @@ module rob #(
                     done[complete_rob_id[j]] <= 1'b1;
                 end
             end
-            // 2) 分配
-            if (alloc_valid && alloc_ready) begin
+            // 2) 分配（可 1 或 2 条）
+            if (alloc_valid[0] && alloc_ready) begin
                 valid[tail]     <= 1'b1;
                 done[tail]      <= 1'b0;
-                pc[tail]        <= alloc_pc;
-                arch_rd[tail]   <= alloc_arch_rd;
-                has_rd[tail]    <= alloc_has_rd;
-                pdst[tail]      <= alloc_pdst;
-                old_pdst[tail]  <= alloc_old_pdst;
-                is_store[tail]  <= alloc_is_store;
-                is_branch[tail] <= alloc_is_branch;
-                is_jal[tail]    <= alloc_is_jal;
-                is_jalr[tail]   <= alloc_is_jalr;
-                illegal[tail]   <= alloc_illegal;
-                pd_target[tail] <= alloc_pd_target;
-                tail <= tail + ROB_ID_W'(1);
+                pc[tail]        <= alloc_pc[0];
+                arch_rd[tail]   <= alloc_arch_rd[0];
+                has_rd[tail]    <= alloc_has_rd[0];
+                pdst[tail]      <= alloc_pdst[0];
+                old_pdst[tail]  <= alloc_old_pdst[0];
+                is_store[tail]  <= alloc_is_store[0];
+                is_branch[tail] <= alloc_is_branch[0];
+                is_jal[tail]    <= alloc_is_jal[0];
+                is_jalr[tail]   <= alloc_is_jalr[0];
+                illegal[tail]   <= alloc_illegal[0];
+                pd_target[tail] <= alloc_pd_target[0];
+                if (alloc_valid[1] && alloc_ready_2) begin
+                    valid[(tail + ROB_ID_W'(1)) % ROB_DEPTH]     <= 1'b1;
+                    done[(tail + ROB_ID_W'(1)) % ROB_DEPTH]      <= 1'b0;
+                    pc[(tail + ROB_ID_W'(1)) % ROB_DEPTH]        <= alloc_pc[1];
+                    arch_rd[(tail + ROB_ID_W'(1)) % ROB_DEPTH]   <= alloc_arch_rd[1];
+                    has_rd[(tail + ROB_ID_W'(1)) % ROB_DEPTH]    <= alloc_has_rd[1];
+                    pdst[(tail + ROB_ID_W'(1)) % ROB_DEPTH]      <= alloc_pdst[1];
+                    old_pdst[(tail + ROB_ID_W'(1)) % ROB_DEPTH]  <= alloc_old_pdst[1];
+                    is_store[(tail + ROB_ID_W'(1)) % ROB_DEPTH]  <= alloc_is_store[1];
+                    is_branch[(tail + ROB_ID_W'(1)) % ROB_DEPTH] <= alloc_is_branch[1];
+                    is_jal[(tail + ROB_ID_W'(1)) % ROB_DEPTH]    <= alloc_is_jal[1];
+                    is_jalr[(tail + ROB_ID_W'(1)) % ROB_DEPTH]   <= alloc_is_jalr[1];
+                    illegal[(tail + ROB_ID_W'(1)) % ROB_DEPTH]   <= alloc_illegal[1];
+                    pd_target[(tail + ROB_ID_W'(1)) % ROB_DEPTH] <= alloc_pd_target[1];
+                    tail <= tail + ROB_ID_W'(2);
+                end else begin
+                    tail <= tail + ROB_ID_W'(1);
+                end
             end
             // 3) 提交推进
             for (int i = 0; i < COMMIT_WIDTH; i++) begin
@@ -257,28 +290,52 @@ module rob #(
                 default: ;
                 endcase
             end
-            // 5) 延迟释放队列：提交时入队，无未解析分支时出队归还；
+            // 5) 延迟释放队列（双通道）：提交时入队，无未解析分支时出队归还；
             //    被 rename 跳过（RAT 引用）的条目轮转到队尾，避免阻塞后续释放
-            if (pend_push) begin
+            if (pend_push0)
                 pend_q[pend_wptr] <= old_pdst[head];
+            if (pend_push1)
+                pend_q[pend_wptr + $clog2(ROB_DEPTH+1)'(pend_push0)] <=
+                    old_pdst[(head + ROB_ID_W'(1)) % ROB_DEPTH];
+            if (pend_push1)
+                pend_wptr <= pend_wptr + $clog2(ROB_DEPTH+1)'(pend_push0) + $clog2(ROB_DEPTH+1)'(1);
+            else if (pend_push0)
                 pend_wptr <= pend_wptr + $clog2(ROB_DEPTH+1)'(1);
-            end
-            if (commit_free_valid && commit_free_taken) begin
+
+            if (commit_free_valid[0] && commit_free_taken[0]) begin
+                if (commit_free_valid[1] && commit_free_taken[1]) begin
+                    pend_rptr <= pend_rptr + $clog2(ROB_DEPTH+1)'(2);
+                end else begin
+                    // 第一通道归还、第二通道被跳过：轮转重排（弹出两槽：归还 + 轮转）
+                    if (commit_free_valid[1]) begin
+                        pend_q[pend_wptr + $clog2(ROB_DEPTH+1)'(pend_push0) +
+                               $clog2(ROB_DEPTH+1)'(pend_push1)] <=
+                            pend_q[pend_rptr + $clog2(ROB_DEPTH+1)'(1)];
+                        pend_wptr <= pend_wptr + $clog2(ROB_DEPTH+1)'(pend_push0) +
+                                     $clog2(ROB_DEPTH+1)'(pend_push1) + $clog2(ROB_DEPTH+1)'(1);
+                        pend_rptr <= pend_rptr + $clog2(ROB_DEPTH+1)'(2);
+                    end else begin
+                        pend_rptr <= pend_rptr + $clog2(ROB_DEPTH+1)'(1);
+                    end
+                end
+            end else if (commit_free_valid[0]) begin
+                // 第一通道被跳过：轮转重排
+                pend_q[pend_wptr + $clog2(ROB_DEPTH+1)'(pend_push0) +
+                       $clog2(ROB_DEPTH+1)'(pend_push1)] <= pend_q[pend_rptr];
+                pend_wptr <= pend_wptr + $clog2(ROB_DEPTH+1)'(pend_push0) +
+                             $clog2(ROB_DEPTH+1)'(pend_push1) + $clog2(ROB_DEPTH+1)'(1);
                 pend_rptr <= pend_rptr + $clog2(ROB_DEPTH+1)'(1);
-            end else if (commit_free_valid && !commit_free_taken) begin
-                // 跳过：轮转重排（重新入队尾部）
-                pend_q[pend_wptr] <= pend_q[pend_rptr];
-                pend_wptr <= pend_wptr + $clog2(ROB_DEPTH+1)'(1);
-                pend_rptr <= pend_rptr + $clog2(ROB_DEPTH+1)'(1);
             end
-            pend_cnt <= pend_cnt + (pend_push ? $clog2(ROB_DEPTH+1)'(1) : '0)
-                                - ((commit_free_valid && commit_free_taken)
-                                   ? $clog2(ROB_DEPTH+1)'(1) : '0);
+            // 轮转（requeue）是"弹出+重推"净零，不进入计数
+            pend_cnt <= pend_cnt
+                        + $clog2(ROB_DEPTH+1)'(pend_push0) + $clog2(ROB_DEPTH+1)'(pend_push1)
+                        - $clog2(ROB_DEPTH+1)'(commit_free_valid[0] && commit_free_taken[0])
+                        - $clog2(ROB_DEPTH+1)'(commit_free_valid[1] && commit_free_taken[1]);
             // 未解析分支数净更新（单一 NBA，饱和钳制防下溢回绕；
             // 提前释放的旧 pdst 由 rename 的 RAT 检查兜底跳过）
-            unresolved_cnt <= ((unresolved_cnt + (uc_alloc_inc ? $clog2(ROB_DEPTH+1)'(1) : '0))
+            unresolved_cnt <= ((unresolved_cnt + uc_alloc_inc)
                                >= (uc_complete_dec_w + uc_flush_dec))
-                            ? (unresolved_cnt + (uc_alloc_inc ? $clog2(ROB_DEPTH+1)'(1) : '0)
+                            ? (unresolved_cnt + uc_alloc_inc
                                - uc_complete_dec_w - uc_flush_dec)
                             : '0;
         end

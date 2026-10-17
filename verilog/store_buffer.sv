@@ -28,8 +28,8 @@ module store_buffer #(
     input  logic [3:0]          fill_wstrb,
 
     // ---- 提交（ROB 提交 store 时）----
-    input  logic                commit_valid,
-    input  logic [ROB_ID_W-1:0] commit_rob_id,
+    input  logic [1:0]              commit_valid,
+    input  logic [1:0][ROB_ID_W-1:0] commit_rob_id,
 
     // ---- 写内存（提交后发出，等响应释放）----
     output logic                wr_req_valid,
@@ -221,10 +221,12 @@ module store_buffer #(
                 end
             end
             // 5) 提交：只匹配未提交条目（同上，防跨代误提交）
-            if (commit_valid) begin
-                for (int i = 0; i < SB_DEPTH; i++) begin
-                    if (valid[i] && !committed[i] && (rob_id[i] == commit_rob_id)) begin
-                        committed[i] <= 1'b1;
+            for (int c = 0; c < 2; c++) begin
+                if (commit_valid[c]) begin
+                    for (int i = 0; i < SB_DEPTH; i++) begin
+                        if (valid[i] && !committed[i] && (rob_id[i] == commit_rob_id[c])) begin
+                            committed[i] <= 1'b1;
+                        end
                     end
                 end
             end
@@ -262,5 +264,6 @@ module store_buffer #(
             end
         end
     end
+
 
 endmodule

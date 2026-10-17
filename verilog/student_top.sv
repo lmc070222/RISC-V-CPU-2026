@@ -184,11 +184,18 @@ module student_top import pkg_cpu2026::*; #(
 
     // ================= 派发 =================
     logic [31:0] fd_pc, fd_instr, fd_pd_target;
-    dec_info_t   fd_dec;
+    logic [31:0] fd_pc2, fd_instr2, fd_pd_target2;
+    dec_info_t   fd_dec, fd_dec2;
     assign fd_pc    = fq[fq_rptr][63:32];
     assign fd_instr = fq[fq_rptr][31:0];
     assign fd_pd_target = fq[fq_rptr][95:64];
     decoder u_fdec (.instr(fd_instr), .dec(fd_dec));
+
+    wire [1:0] fq_rptr2 = fq_rptr + 2'd1;
+    assign fd_pc2    = fq[fq_rptr2][63:32];
+    assign fd_instr2 = fq[fq_rptr2][31:0];
+    assign fd_pd_target2 = fq[fq_rptr2][95:64];
+    decoder u_fdec2 (.instr(fd_instr2), .dec(fd_dec2));
 
     logic fd_alu, fd_mul, fd_lsu, fd_bru, fd_store, fd_has_rd;
     assign fd_alu   = fd_dec.is_alu || fd_dec.is_lui || fd_dec.is_auipc;
@@ -198,33 +205,42 @@ module student_top import pkg_cpu2026::*; #(
     assign fd_store = fd_dec.is_store;
     assign fd_has_rd = fd_dec.rd_write && (fd_dec.rd != 5'd0);
 
-    logic disp_valid;
-    logic disp_ready;
+    logic fd2_alu, fd2_mul, fd2_lsu, fd2_bru, fd2_store, fd2_has_rd;
+    assign fd2_alu   = fd_dec2.is_alu || fd_dec2.is_lui || fd_dec2.is_auipc;
+    assign fd2_mul   = fd_dec2.is_mul || fd_dec2.is_div;
+    assign fd2_lsu   = fd_dec2.is_load || fd_dec2.is_store;
+    assign fd2_bru   = fd_dec2.is_branch || fd_dec2.is_jal || fd_dec2.is_jalr;
+    assign fd2_store = fd_dec2.is_store;
+    assign fd2_has_rd = fd_dec2.rd_write && (fd_dec2.rd != 5'd0);
+
     logic halted;
 
     // ================= rename =================
-    logic        rn_alloc_valid;
-    logic [ROB_W-1:0] rn_alloc_rob_id;
-    logic [PRF_W-1:0] rn_alloc_pdst, rn_alloc_pdst_c, rn_alloc_old_pdst_c;
-    logic [PRF_W-1:0] rn_ps1, rn_ps2;
-    logic        rn_s1_ready, rn_s2_ready;
-    logic [31:0] rn_s1_data, rn_s2_data;
+    logic [1:0]  rn_alloc_valid;
+    logic [ROB_W-1:0] rn_alloc_rob_id0, rn_alloc_rob_id1;
+    logic [PRF_W-1:0] rn_alloc_pdst0, rn_alloc_pdst1;
+    logic [PRF_W-1:0] rn_alloc_pdst0_c, rn_alloc_pdst1_c;
+    logic [PRF_W-1:0] rn_alloc_old_pdst0_c, rn_alloc_old_pdst1_c;
+    logic [PRF_W-1:0] rn_ps1_0, rn_ps2_0, rn_ps1_1, rn_ps2_1;
+    logic        rn_s1r_0, rn_s2r_0, rn_s1r_1, rn_s2r_1;
+    logic [31:0] rn_s1d_0, rn_s2d_0, rn_s1d_1, rn_s2d_1;
 
     // ================= ROB =================
-    logic        rob_alloc_valid;
+    logic [1:0]  rob_alloc_valid;
     logic        rob_alloc_ready;
+    logic        rob_alloc_ready_2;
     logic [ROB_W-1:0] rob_next_id, rob_head_id;
     logic        rob_commit_valid;
-    logic        rob_commit_mask;
-    logic [ROB_W-1:0] rob_commit_rob_id;
-    logic        rob_commit_has_rd;
-    logic [PRF_W-1:0] rob_commit_old_pdst;
-    logic        rob_commit_is_store;
-    logic        rob_commit_illegal;
-    logic [31:0] rob_commit_pc;
-    logic        rob_commit_free_valid;
-    logic [PRF_W-1:0] rob_commit_free_pdst;
-    logic        rob_commit_free_taken;
+    logic [1:0]  rob_commit_mask;
+    logic [1:0][ROB_W-1:0] rob_commit_rob_id;
+    logic [1:0]  rob_commit_has_rd;
+    logic [1:0][PRF_W-1:0] rob_commit_old_pdst;
+    logic [1:0]  rob_commit_is_store;
+    logic [1:0]  rob_commit_illegal;
+    logic [1:0][31:0] rob_commit_pc;
+    logic [1:0]  rob_commit_free_valid;
+    logic [1:0][PRF_W-1:0] rob_commit_free_pdst;
+    logic [1:0]  rob_commit_free_taken;
     logic [31:0] rob_lookup_pd_target;
     logic        rob_flush_free_valid;
     logic [PRF_W-1:0] rob_flush_free_pdst;
@@ -236,8 +252,8 @@ module student_top import pkg_cpu2026::*; #(
     logic [ROB_W-1:0] sb_fill_rob_id;
     logic [31:0] sb_fill_addr, sb_fill_data;
     logic [3:0]  sb_fill_wstrb;
-    logic        sb_commit_valid;
-    logic [ROB_W-1:0] sb_commit_rob_id;
+    logic [1:0]  sb_commit_valid;
+    logic [1:0][ROB_W-1:0] sb_commit_rob_id;
     logic        sb_query_valid;
     logic [ROB_W-1:0] sb_query_rob_id;
     logic [31:0] sb_query_addr;
@@ -270,31 +286,62 @@ module student_top import pkg_cpu2026::*; #(
     logic target_ready;
     // 在飞分配预留：rn 阶段指令的分配比派发检查晚一拍采样，
     // 若该指令与当前派发目标同一 IQ，需保证有 2 个空槽（弃置槽位=永久死锁）
-    assign target_ready = fd_alu ? (iq_alu_alloc_ready && (!iq_alu_alloc_valid || iq_alu_alloc_ready_2)) :
-                          fd_mul ? (iq_mdu_alloc_ready && (!iq_mdu_alloc_valid || iq_mdu_alloc_ready_2)) :
-                          fd_lsu ? (iq_lsu_alloc_ready && (!iq_lsu_alloc_valid || iq_lsu_alloc_ready_2)) :
-                          fd_bru ? (iq_bru_alloc_ready && (!iq_bru_alloc_valid || iq_bru_alloc_ready_2)) : 1'b1;
+    function automatic logic tq_ready(input logic sel, input logic ok, input logic av, input logic ok2);
+        tq_ready = !sel || (ok && (!av || ok2));
+    endfunction
+
+    logic target_ready1;
+    assign target_ready = tq_ready(fd_alu,  iq_alu_alloc_ready,  iq_alu_alloc_valid,  iq_alu_alloc_ready_2)  &&
+                          tq_ready(fd_mul,  iq_mdu_alloc_ready,  iq_mdu_alloc_valid,  iq_mdu_alloc_ready_2)  &&
+                          tq_ready(fd_lsu,  iq_lsu_alloc_ready,  iq_lsu_alloc_valid,  iq_lsu_alloc_ready_2)  &&
+                          tq_ready(fd_bru,  iq_bru_alloc_ready,  iq_bru_alloc_valid,  iq_bru_alloc_ready_2);
+    assign target_ready1 = tq_ready(fd2_alu, iq_alu_alloc_ready, iq_alu_alloc_valid, iq_alu_alloc_ready_2)  &&
+                           tq_ready(fd2_mul, iq_mdu_alloc_ready, iq_mdu_alloc_valid, iq_mdu_alloc_ready_2)  &&
+                           tq_ready(fd2_lsu, iq_lsu_alloc_ready, iq_lsu_alloc_valid, iq_lsu_alloc_ready_2)  &&
+                           tq_ready(fd2_bru, iq_bru_alloc_ready, iq_bru_alloc_valid, iq_bru_alloc_ready_2);
+
+    // 成对派发条件：目标 IQ 不同（IQ 单写口）、不同时为 store（SB 单分配口）
+    wire [3:0] fd_sel  = {fd_bru,  fd_lsu,  fd_mul,  fd_alu};
+    wire [3:0] fd_sel2 = {fd2_bru, fd2_lsu, fd2_mul, fd2_alu};
+    wire pair_instr_ok = (fd_sel != fd_sel2) && !(fd_store && fd2_store);
+
+    logic disp_valid;
+    logic disp_pair;
+    logic disp_ready;
 
     logic ext_ready;
-    assign ext_ready = rob_alloc_ready && target_ready && (!fd_store || sb_alloc_ready);
+    assign ext_ready = disp_pair ? (rob_alloc_ready_2 && target_ready && target_ready1 &&
+                                    (!fd_store || sb_alloc_ready) &&
+                                    (!fd2_store || sb_alloc_ready))
+                                 : (rob_alloc_ready && target_ready && (!fd_store || sb_alloc_ready));
 
     assign disp_valid = !reset && !halted && (fq_cnt != 3'd0) && !flush_valid && !illegal_halt;
+    localparam bit PAIR_EN = 1'b0;   // 成对派发开关（调试中；单派发已验证 18/19）
+    assign disp_pair  = PAIR_EN && disp_valid && (fq_cnt >= 3'd2) && pair_instr_ok;
 
     rename #(.WB_PORTS(4), .ROB_DEPTH(16), .ROB_ID_W(ROB_W)) u_rename (
         .clk(clock), .reset(reset),
-        .disp_valid(disp_valid),
+        .disp_valid({disp_pair, disp_valid}),
+        .disp_dec0(fd_dec),
+        .disp_dec1(fd_dec2),
         .ext_ready(ext_ready),
         .next_rob_id(rob_next_id),
-        .disp_dec(fd_dec),
         .disp_ready(disp_ready),
         .alloc_valid(rn_alloc_valid),
-        .alloc_rob_id(rn_alloc_rob_id),
-        .alloc_pdst(rn_alloc_pdst),
-        .alloc_pdst_c(rn_alloc_pdst_c),
-        .alloc_old_pdst_c(rn_alloc_old_pdst_c),
-        .ps1(rn_ps1), .ps2(rn_ps2),
-        .s1_ready(rn_s1_ready), .s2_ready(rn_s2_ready),
-        .s1_data(rn_s1_data), .s2_data(rn_s2_data),
+        .alloc_rob_id0(rn_alloc_rob_id0),
+        .alloc_rob_id1(rn_alloc_rob_id1),
+        .alloc_pdst0(rn_alloc_pdst0),
+        .alloc_pdst1(rn_alloc_pdst1),
+        .alloc_pdst0_c(rn_alloc_pdst0_c),
+        .alloc_pdst1_c(rn_alloc_pdst1_c),
+        .alloc_old_pdst0_c(rn_alloc_old_pdst0_c),
+        .alloc_old_pdst1_c(rn_alloc_old_pdst1_c),
+        .ps1_0(rn_ps1_0), .ps2_0(rn_ps2_0),
+        .ps1_1(rn_ps1_1), .ps2_1(rn_ps2_1),
+        .s1_ready_0(rn_s1r_0), .s2_ready_0(rn_s2r_0),
+        .s1_ready_1(rn_s1r_1), .s2_ready_1(rn_s2r_1),
+        .s1_data_0(rn_s1d_0), .s2_data_0(rn_s2d_0),
+        .s1_data_1(rn_s1d_1), .s2_data_1(rn_s2d_1),
         .commit_free_valid(rob_commit_free_valid),
         .commit_free_pdst(rob_commit_free_pdst),
         .commit_free_taken(rob_commit_free_taken),
@@ -308,41 +355,46 @@ module student_top import pkg_cpu2026::*; #(
     );
 
     // 派发锁存（与 rename 输出同沿）
-    logic        rn_valid;
-    dec_info_t   rn_dec;
-    logic [31:0] rn_pc, rn_instr;
+    logic [1:0]  rn_valid;
+    dec_info_t   rn_dec0, rn_dec1;
+    logic [31:0] rn_pc0, rn_pc1, rn_instr0, rn_instr1;
 
     always_ff @(posedge clock) begin
-        if (reset) rn_valid <= 1'b0;
+        if (reset) rn_valid <= '0;
         else begin
-            rn_valid <= disp_valid && disp_ready;
-            rn_dec <= fd_dec;
-            rn_pc  <= fd_pc;
-            rn_instr <= fd_instr;
+            rn_valid <= {disp_valid && disp_ready && disp_pair, disp_valid && disp_ready};
+            rn_dec0 <= fd_dec;
+            rn_dec1 <= fd_dec2;
+            rn_pc0  <= fd_pc;
+            rn_pc1  <= fd_pc2;
+            rn_instr0 <= fd_instr;
+            rn_instr1 <= fd_instr2;
         end
     end
 
     // ================= ROB =================
-    assign rob_alloc_valid = disp_valid && disp_ready;
+    assign rob_alloc_valid = {disp_valid && disp_ready && disp_pair, disp_valid && disp_ready};
 
     rob #(
-        .ROB_DEPTH(16), .ROB_ID_W(ROB_W), .COMMIT_WIDTH(1),
+        .ROB_DEPTH(16), .ROB_ID_W(ROB_W), .COMMIT_WIDTH(2),
         .PRF_W(PRF_W), .WB_PORTS(4)
     ) u_rob (
         .clk(clock), .reset(reset),
         .alloc_valid(rob_alloc_valid),
         .alloc_ready(rob_alloc_ready),
-        .alloc_pc(fd_pc),
-        .alloc_arch_rd(fd_dec.rd),
-        .alloc_has_rd(fd_has_rd),
-        .alloc_pdst(rn_alloc_pdst_c),
-        .alloc_old_pdst(fd_has_rd ? rn_alloc_old_pdst_c : '0),
-        .alloc_is_store(fd_store),
-        .alloc_is_branch(fd_dec.is_branch),
-        .alloc_is_jal(fd_dec.is_jal),
-        .alloc_is_jalr(fd_dec.is_jalr),
-        .alloc_illegal(fd_dec.illegal),
-        .alloc_pd_target(fd_pd_target),
+        .alloc_ready_2(rob_alloc_ready_2),
+        .alloc_pc({fd_pc2, fd_pc}),
+        .alloc_arch_rd({fd_dec2.rd, fd_dec.rd}),
+        .alloc_has_rd({fd2_has_rd, fd_has_rd}),
+        .alloc_pdst({rn_alloc_pdst1_c, rn_alloc_pdst0_c}),
+        .alloc_old_pdst({fd2_has_rd ? rn_alloc_old_pdst1_c : '0,
+                         fd_has_rd ? rn_alloc_old_pdst0_c : '0}),
+        .alloc_is_store({fd2_store, fd_store}),
+        .alloc_is_branch({fd_dec2.is_branch, fd_dec.is_branch}),
+        .alloc_is_jal({fd_dec2.is_jal, fd_dec.is_jal}),
+        .alloc_is_jalr({fd_dec2.is_jalr, fd_dec.is_jalr}),
+        .alloc_illegal({fd_dec2.illegal, fd_dec.illegal}),
+        .alloc_pd_target({fd_pd_target2, fd_pd_target}),
         .next_rob_id(rob_next_id),
         .head_rob_id(rob_head_id),
         .complete_valid(complete_valid),
@@ -373,13 +425,14 @@ module student_top import pkg_cpu2026::*; #(
 
     // ================= SB =================
     logic sb_alloc_valid_x;
-    assign sb_alloc_valid_x = disp_valid && disp_ready && fd_store;
+    wire sb_store_l1 = disp_pair && fd2_store && !fd_store;   // 成对派发时 store 只可能在 lane1
+    assign sb_alloc_valid_x = disp_valid && disp_ready && (fd_store || sb_store_l1);
 
     store_buffer #(.SB_DEPTH(8), .ROB_ID_W(ROB_W)) u_sb (
         .clk(clock), .reset(reset),
         .alloc_valid(sb_alloc_valid_x),
         .alloc_ready(sb_alloc_ready),
-        .alloc_rob_id(rob_next_id),
+        .alloc_rob_id(sb_store_l1 ? rob_next_id + ROB_W'(1) : rob_next_id),
         .fill_valid(sb_fill_valid),
         .fill_rob_id(sb_fill_rob_id),
         .fill_addr(sb_fill_addr),
@@ -407,7 +460,8 @@ module student_top import pkg_cpu2026::*; #(
         .tail_rob_id(rob_next_id)
     );
 
-    assign sb_commit_valid = rob_commit_valid && rob_commit_mask && rob_commit_is_store;
+    assign sb_commit_valid = {rob_commit_valid && rob_commit_mask[1] && rob_commit_is_store[1],
+                              rob_commit_valid && rob_commit_mask[0] && rob_commit_is_store[0]};
     assign sb_commit_rob_id = rob_commit_rob_id;
 
     // ================= D-cache =================
@@ -429,56 +483,145 @@ module student_top import pkg_cpu2026::*; #(
         .wr_resp_valid(wr_resp_valid)
     );
 
-    // ================= 分派 op 编码与操作数（cycle N+1，基于 rn_dec）=================
+    // ================= 分派 op 编码与操作数（cycle N+1，基于 rn_dec0/1）=================
     logic [OP_W-1:0] d_alu_op, d_mdu_op, d_lsu_op, d_bru_op;
     logic d_alu_has1, d_alu_has2, d_alu_useimm;
     logic d_mdu_has1, d_mdu_has2;
     logic d_lsu_has1, d_lsu_has2;
     logic d_bru_has1, d_bru_has2;
+    logic [OP_W-1:0] d2_alu_op, d2_mdu_op, d2_lsu_op, d2_bru_op;
+    logic d2_alu_has1, d2_alu_has2, d2_alu_useimm;
+    logic d2_mdu_has1, d2_mdu_has2;
+    logic d2_lsu_has1, d2_lsu_has2;
+    logic d2_bru_has1, d2_bru_has2;
 
     always_comb begin
-        d_alu_op = {3'b000, rn_dec.alu_op};
-        if (rn_dec.is_lui)   d_alu_op = 8'h20;
-        if (rn_dec.is_auipc) d_alu_op = 8'h40;
-        d_mdu_op = {3'b000, rn_dec.is_mul, rn_dec.mul_type, rn_dec.div_type};
-        d_lsu_op = rn_dec.is_store ? {1'b1, 2'b00, rn_dec.st_type, 3'b000}
-                                   : {2'b00, rn_dec.ld_type, 3'b000};
-        d_bru_op = {rn_dec.is_jalr, rn_dec.is_jal, rn_dec.is_branch,
-                    (rn_dec.rd_write && (rn_dec.rd != 5'd0)), 1'b0, rn_dec.br_type};
-        d_alu_has1 = rn_dec.is_alu;
-        d_alu_has2 = rn_dec.uses_rs2;
-        d_alu_useimm = rn_dec.is_alu && !rn_dec.uses_rs2;
+        d_alu_op = {3'b000, rn_dec0.alu_op};
+        if (rn_dec0.is_lui)   d_alu_op = 8'h20;
+        if (rn_dec0.is_auipc) d_alu_op = 8'h40;
+        d_mdu_op = {3'b000, rn_dec0.is_mul, rn_dec0.mul_type, rn_dec0.div_type};
+        d_lsu_op = rn_dec0.is_store ? {1'b1, 2'b00, rn_dec0.st_type, 3'b000}
+                                    : {2'b00, rn_dec0.ld_type, 3'b000};
+        d_bru_op = {rn_dec0.is_jalr, rn_dec0.is_jal, rn_dec0.is_branch,
+                    (rn_dec0.rd_write && (rn_dec0.rd != 5'd0)), 1'b0, rn_dec0.br_type};
+        d_alu_has1 = rn_dec0.is_alu;
+        d_alu_has2 = rn_dec0.uses_rs2;
+        d_alu_useimm = rn_dec0.is_alu && !rn_dec0.uses_rs2;
         d_mdu_has1 = 1'b1;
         d_mdu_has2 = 1'b1;
         d_lsu_has1 = 1'b1;
-        d_lsu_has2 = rn_dec.is_store;
-        d_bru_has1 = rn_dec.is_branch || rn_dec.is_jalr;
-        d_bru_has2 = rn_dec.is_branch;
+        d_lsu_has2 = rn_dec0.is_store;
+        d_bru_has1 = rn_dec0.is_branch || rn_dec0.is_jalr;
+        d_bru_has2 = rn_dec0.is_branch;
+
+        d2_alu_op = {3'b000, rn_dec1.alu_op};
+        if (rn_dec1.is_lui)   d2_alu_op = 8'h20;
+        if (rn_dec1.is_auipc) d2_alu_op = 8'h40;
+        d2_mdu_op = {3'b000, rn_dec1.is_mul, rn_dec1.mul_type, rn_dec1.div_type};
+        d2_lsu_op = rn_dec1.is_store ? {1'b1, 2'b00, rn_dec1.st_type, 3'b000}
+                                     : {2'b00, rn_dec1.ld_type, 3'b000};
+        d2_bru_op = {rn_dec1.is_jalr, rn_dec1.is_jal, rn_dec1.is_branch,
+                     (rn_dec1.rd_write && (rn_dec1.rd != 5'd0)), 1'b0, rn_dec1.br_type};
+        d2_alu_has1 = rn_dec1.is_alu;
+        d2_alu_has2 = rn_dec1.uses_rs2;
+        d2_alu_useimm = rn_dec1.is_alu && !rn_dec1.uses_rs2;
+        d2_mdu_has1 = 1'b1;
+        d2_mdu_has2 = 1'b1;
+        d2_lsu_has1 = 1'b1;
+        d2_lsu_has2 = rn_dec1.is_store;
+        d2_bru_has1 = rn_dec1.is_branch || rn_dec1.is_jalr;
+        d2_bru_has2 = rn_dec1.is_branch;
     end
 
-    logic rn_alu, rn_mul, rn_lsu, rn_bru, rn_store;
-    assign rn_alu = rn_valid && (rn_dec.is_alu || rn_dec.is_lui || rn_dec.is_auipc);
-    assign rn_mul = rn_valid && (rn_dec.is_mul || rn_dec.is_div);
-    assign rn_lsu = rn_valid && (rn_dec.is_load || rn_dec.is_store);
-    assign rn_bru = rn_valid && (rn_dec.is_branch || rn_dec.is_jal || rn_dec.is_jalr);
+    logic rn_alu0, rn_mul0, rn_lsu0, rn_bru0, rn_store;
+    logic rn_alu1, rn_mul1, rn_lsu1, rn_bru1;
+    assign rn_alu0 = rn_valid[0] && (rn_dec0.is_alu || rn_dec0.is_lui || rn_dec0.is_auipc);
+    assign rn_mul0 = rn_valid[0] && (rn_dec0.is_mul || rn_dec0.is_div);
+    assign rn_lsu0 = rn_valid[0] && (rn_dec0.is_load || rn_dec0.is_store);
+    assign rn_bru0 = rn_valid[0] && (rn_dec0.is_branch || rn_dec0.is_jal || rn_dec0.is_jalr);
+    assign rn_alu1 = rn_valid[1] && (rn_dec1.is_alu || rn_dec1.is_lui || rn_dec1.is_auipc);
+    assign rn_mul1 = rn_valid[1] && (rn_dec1.is_mul || rn_dec1.is_div);
+    assign rn_lsu1 = rn_valid[1] && (rn_dec1.is_load || rn_dec1.is_store);
+    assign rn_bru1 = rn_valid[1] && (rn_dec1.is_branch || rn_dec1.is_jal || rn_dec1.is_jalr);
 
-    assign iq_alu_alloc_valid = rn_alu;
-    assign iq_mdu_alloc_valid = rn_mul;
-    assign iq_lsu_alloc_valid = rn_lsu;
-    assign iq_bru_alloc_valid = rn_bru;
+    assign iq_alu_alloc_valid = rn_alu0 || rn_alu1;
+    assign iq_mdu_alloc_valid = rn_mul0 || rn_mul1;
+    assign iq_lsu_alloc_valid = rn_lsu0 || rn_lsu1;
+    assign iq_bru_alloc_valid = rn_bru0 || rn_bru1;
+
+    // 分配载荷：按目标 IQ 各自选择 lane（pair 内两条目标 IQ 不同；
+    // 单条时也可能是 lane1 独存——例如 lane0 非法/异常时由上层保证整对派发）
+    wire alu_l1 = rn_alu1;
+    wire mdu_l1 = rn_mul1;
+    wire lsu_l1 = rn_lsu1;
+    wire bru_l1 = rn_bru1;
+
+    wire [ROB_W-1:0] alu_rob = alu_l1 ? rn_alloc_rob_id1 : rn_alloc_rob_id0;
+    wire [PRF_W-1:0] alu_pdst = alu_l1 ? rn_alloc_pdst1 : rn_alloc_pdst0;
+    wire [PRF_W-1:0] alu_ps1 = alu_l1 ? rn_ps1_1 : rn_ps1_0;
+    wire [PRF_W-1:0] alu_ps2 = alu_l1 ? rn_ps2_1 : rn_ps2_0;
+    wire             alu_s1r = alu_l1 ? rn_s1r_1 : rn_s1r_0;
+    wire             alu_s2r = alu_l1 ? rn_s2r_1 : rn_s2r_0;
+    wire [31:0]      alu_s1d = alu_l1 ? rn_s1d_1 : rn_s1d_0;
+    wire [31:0]      alu_s2d = alu_l1 ? rn_s2d_1 : rn_s2d_0;
+    wire [31:0]      alu_imm = alu_l1 ? rn_dec1.imm : rn_dec0.imm;
+    wire [31:0]      alu_pc  = alu_l1 ? rn_pc1 : rn_pc0;
+    wire [OP_W-1:0]  alu_op  = alu_l1 ? d2_alu_op : d_alu_op;
+    wire alu_h1 = alu_l1 ? d2_alu_has1 : d_alu_has1;
+    wire alu_h2 = alu_l1 ? d2_alu_has2 : d_alu_has2;
+    wire alu_ui = alu_l1 ? d2_alu_useimm : d_alu_useimm;
+
+    wire [ROB_W-1:0] mdu_rob = mdu_l1 ? rn_alloc_rob_id1 : rn_alloc_rob_id0;
+    wire [PRF_W-1:0] mdu_pdst = mdu_l1 ? rn_alloc_pdst1 : rn_alloc_pdst0;
+    wire [PRF_W-1:0] mdu_ps1 = mdu_l1 ? rn_ps1_1 : rn_ps1_0;
+    wire [PRF_W-1:0] mdu_ps2 = mdu_l1 ? rn_ps2_1 : rn_ps2_0;
+    wire             mdu_s1r = mdu_l1 ? rn_s1r_1 : rn_s1r_0;
+    wire             mdu_s2r = mdu_l1 ? rn_s2r_1 : rn_s2r_0;
+    wire [31:0]      mdu_s1d = mdu_l1 ? rn_s1d_1 : rn_s1d_0;
+    wire [31:0]      mdu_s2d = mdu_l1 ? rn_s2d_1 : rn_s2d_0;
+    wire [OP_W-1:0]  mdu_op  = mdu_l1 ? d2_mdu_op : d_mdu_op;
+    wire mdu_h1 = mdu_l1 ? d2_mdu_has1 : d_mdu_has1;
+    wire mdu_h2 = mdu_l1 ? d2_mdu_has2 : d_mdu_has2;
+
+    wire [ROB_W-1:0] lsu_rob = lsu_l1 ? rn_alloc_rob_id1 : rn_alloc_rob_id0;
+    wire [PRF_W-1:0] lsu_pdst = lsu_l1 ? rn_alloc_pdst1 : rn_alloc_pdst0;
+    wire [PRF_W-1:0] lsu_ps1 = lsu_l1 ? rn_ps1_1 : rn_ps1_0;
+    wire [PRF_W-1:0] lsu_ps2 = lsu_l1 ? rn_ps2_1 : rn_ps2_0;
+    wire             lsu_s1r = lsu_l1 ? rn_s1r_1 : rn_s1r_0;
+    wire             lsu_s2r = lsu_l1 ? rn_s2r_1 : rn_s2r_0;
+    wire [31:0]      lsu_s1d = lsu_l1 ? rn_s1d_1 : rn_s1d_0;
+    wire [31:0]      lsu_s2d = lsu_l1 ? rn_s2d_1 : rn_s2d_0;
+    wire [31:0]      lsu_imm = lsu_l1 ? rn_dec1.imm : rn_dec0.imm;
+    wire [OP_W-1:0]  lsu_op  = lsu_l1 ? d2_lsu_op : d_lsu_op;
+    wire lsu_h1 = lsu_l1 ? d2_lsu_has1 : d_lsu_has1;
+    wire lsu_h2 = lsu_l1 ? d2_lsu_has2 : d_lsu_has2;
+
+    wire [ROB_W-1:0] bru_rob = bru_l1 ? rn_alloc_rob_id1 : rn_alloc_rob_id0;
+    wire [PRF_W-1:0] bru_pdst = bru_l1 ? rn_alloc_pdst1 : rn_alloc_pdst0;
+    wire [PRF_W-1:0] bru_ps1 = bru_l1 ? rn_ps1_1 : rn_ps1_0;
+    wire [PRF_W-1:0] bru_ps2 = bru_l1 ? rn_ps2_1 : rn_ps2_0;
+    wire             bru_s1r = bru_l1 ? rn_s1r_1 : rn_s1r_0;
+    wire             bru_s2r = bru_l1 ? rn_s2r_1 : rn_s2r_0;
+    wire [31:0]      bru_s1d = bru_l1 ? rn_s1d_1 : rn_s1d_0;
+    wire [31:0]      bru_s2d = bru_l1 ? rn_s2d_1 : rn_s2d_0;
+    wire [31:0]      bru_imm = bru_l1 ? rn_dec1.imm : rn_dec0.imm;
+    wire [31:0]      bru_pc  = bru_l1 ? rn_pc1 : rn_pc0;
+    wire [OP_W-1:0]  bru_op  = bru_l1 ? d2_bru_op : d_bru_op;
+    wire bru_h1 = bru_l1 ? d2_bru_has1 : d_bru_has1;
+    wire bru_h2 = bru_l1 ? d2_bru_has2 : d_bru_has2;
 
     // ================= IQ×4 =================
     issue_queue #(.IQ_DEPTH(8), .ISSUE_WIDTH(1), .WAKEUP_PORTS(4), .PRF_W(PRF_W), .ROB_ID_W(ROB_W), .OP_W(OP_W))
     u_iq_alu (
         .clk(clock), .reset(reset),
         .alloc_valid(iq_alu_alloc_valid), .alloc_ready(iq_alu_alloc_ready), .alloc_ready_2(iq_alu_alloc_ready_2),
-        .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
-        .alloc_has_rs1(d_alu_has1), .alloc_has_rs2(d_alu_has2),
-        .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
-        .alloc_s1_ready(rn_s1_ready), .alloc_s2_ready(rn_s2_ready),
-        .alloc_s1_data(rn_s1_data), .alloc_s2_data(rn_s2_data),
-        .alloc_imm(rn_dec.imm), .alloc_use_imm(d_alu_useimm),
-        .alloc_pc(rn_pc), .alloc_op(d_alu_op),
+        .alloc_rob_id(alu_rob), .alloc_pdst(alu_pdst),
+        .alloc_has_rs1(alu_h1), .alloc_has_rs2(alu_h2),
+        .alloc_p1(alu_ps1), .alloc_p2(alu_ps2),
+        .alloc_s1_ready(alu_s1r), .alloc_s2_ready(alu_s2r),
+        .alloc_s1_data(alu_s1d), .alloc_s2_data(alu_s2d),
+        .alloc_imm(alu_imm), .alloc_use_imm(alu_ui),
+        .alloc_pc(alu_pc), .alloc_op(alu_op),
         .wakeup_valid(cdb_valid), .wakeup_tag(cdb_pdst), .wakeup_data(cdb_data),
         .head_rob_id(rob_head_id),
         .issue_block(1'b0),
@@ -494,11 +637,11 @@ module student_top import pkg_cpu2026::*; #(
     u_iq_mdu (
         .clk(clock), .reset(reset),
         .alloc_valid(iq_mdu_alloc_valid), .alloc_ready(iq_mdu_alloc_ready), .alloc_ready_2(iq_mdu_alloc_ready_2),
-        .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
-        .alloc_has_rs1(d_mdu_has1), .alloc_has_rs2(d_mdu_has2),
-        .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
-        .alloc_s1_ready(rn_s1_ready), .alloc_s2_ready(rn_s2_ready),
-        .alloc_s1_data(rn_s1_data), .alloc_s2_data(rn_s2_data),
+        .alloc_rob_id(mdu_rob), .alloc_pdst(mdu_pdst),
+        .alloc_has_rs1(mdu_h1), .alloc_has_rs2(mdu_h2),
+        .alloc_p1(mdu_ps1), .alloc_p2(mdu_ps2),
+        .alloc_s1_ready(mdu_s1r), .alloc_s2_ready(mdu_s2r),
+        .alloc_s1_data(mdu_s1d), .alloc_s2_data(mdu_s2d),
         .alloc_imm(32'd0), .alloc_use_imm(1'b0),
         .alloc_pc(32'd0), .alloc_op(d_mdu_op),
         .wakeup_valid(cdb_valid), .wakeup_tag(cdb_pdst), .wakeup_data(cdb_data),
@@ -516,13 +659,13 @@ module student_top import pkg_cpu2026::*; #(
     u_iq_lsu (
         .clk(clock), .reset(reset),
         .alloc_valid(iq_lsu_alloc_valid), .alloc_ready(iq_lsu_alloc_ready), .alloc_ready_2(iq_lsu_alloc_ready_2),
-        .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
-        .alloc_has_rs1(d_lsu_has1), .alloc_has_rs2(d_lsu_has2),
-        .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
-        .alloc_s1_ready(rn_s1_ready), .alloc_s2_ready(rn_s2_ready),
-        .alloc_s1_data(rn_s1_data), .alloc_s2_data(rn_s2_data),
-        .alloc_imm(rn_dec.imm), .alloc_use_imm(1'b0),
-        .alloc_pc(32'd0), .alloc_op(d_lsu_op),
+        .alloc_rob_id(lsu_rob), .alloc_pdst(lsu_pdst),
+        .alloc_has_rs1(lsu_h1), .alloc_has_rs2(lsu_h2),
+        .alloc_p1(lsu_ps1), .alloc_p2(lsu_ps2),
+        .alloc_s1_ready(lsu_s1r), .alloc_s2_ready(lsu_s2r),
+        .alloc_s1_data(lsu_s1d), .alloc_s2_data(lsu_s2d),
+        .alloc_imm(lsu_imm), .alloc_use_imm(1'b0),
+        .alloc_pc(32'd0), .alloc_op(lsu_op),
         .wakeup_valid(cdb_valid), .wakeup_tag(cdb_pdst), .wakeup_data(cdb_data),
         .head_rob_id(rob_head_id),
         .issue_block(lsu_busy),
@@ -538,13 +681,13 @@ module student_top import pkg_cpu2026::*; #(
     u_iq_bru (
         .clk(clock), .reset(reset),
         .alloc_valid(iq_bru_alloc_valid), .alloc_ready(iq_bru_alloc_ready), .alloc_ready_2(iq_bru_alloc_ready_2),
-        .alloc_rob_id(rn_alloc_rob_id), .alloc_pdst(rn_alloc_pdst),
-        .alloc_has_rs1(d_bru_has1), .alloc_has_rs2(d_bru_has2),
-        .alloc_p1(rn_ps1), .alloc_p2(rn_ps2),
-        .alloc_s1_ready(rn_s1_ready), .alloc_s2_ready(rn_s2_ready),
-        .alloc_s1_data(rn_s1_data), .alloc_s2_data(rn_s2_data),
-        .alloc_imm(rn_dec.imm), .alloc_use_imm(1'b0),
-        .alloc_pc(rn_pc), .alloc_op(d_bru_op),
+        .alloc_rob_id(bru_rob), .alloc_pdst(bru_pdst),
+        .alloc_has_rs1(bru_h1), .alloc_has_rs2(bru_h2),
+        .alloc_p1(bru_ps1), .alloc_p2(bru_ps2),
+        .alloc_s1_ready(bru_s1r), .alloc_s2_ready(bru_s2r),
+        .alloc_s1_data(bru_s1d), .alloc_s2_data(bru_s2d),
+        .alloc_imm(bru_imm), .alloc_use_imm(1'b0),
+        .alloc_pc(bru_pc), .alloc_op(bru_op),
         .wakeup_valid(cdb_valid), .wakeup_tag(cdb_pdst), .wakeup_data(cdb_data),
         .head_rob_id(rob_head_id),
         .issue_block(1'b0),
@@ -881,6 +1024,7 @@ module student_top import pkg_cpu2026::*; #(
 
     // ================= 取指单元（I-cache 驱动）=================
     assign fq_pop             = disp_valid && disp_ready;
+    wire   fq_pop2            = fq_pop && disp_pair;
 
     // 查询发射条件：查询槽空闲（或本拍消费）且 I-cache 可接收且 FIFO 有空间
     // 消费同拍再发射时，新查询的 pc 是本拍命中的预测目标 lf_pd
@@ -932,8 +1076,10 @@ module student_top import pkg_cpu2026::*; #(
                                   cycle_cnt, launch_pc, predicted_next, f_pred_hit, f_pred_taken,
                                   f_pred_target);
                 end
-                fq_cnt <= fq_cnt + ((lf_on && ic_hit) ? 3'd1 : 3'd0) - (fq_pop ? 3'd1 : 3'd0);
-                if (fq_pop) fq_rptr <= fq_rptr + 2'd1;
+                fq_cnt <= fq_cnt + ((lf_on && ic_hit) ? 3'd1 : 3'd0)
+                                  - (fq_pop2 ? 3'd2 : (fq_pop ? 3'd1 : 3'd0));
+                if (fq_pop2)     fq_rptr <= fq_rptr + 2'd2;
+                else if (fq_pop) fq_rptr <= fq_rptr + 2'd1;
             end
             if (ic_rd_req && ic_rd_ready) ro_type[ro_wptr] <= 1'b0;
             if (dc_rd_req && dc_rd_ready) ro_type[ro_wptr] <= 1'b1;
@@ -982,9 +1128,12 @@ module student_top import pkg_cpu2026::*; #(
                                   cycle_cnt, j, cdb_rob_id[j], cdb_pdst[j], cdb_data[j]);
                 if (rob_commit_valid)
                     $fdisplay(dbg_fd, "[commit] c=%0d rob=%0d pc=%08h has_rd=%b old_pdst=%0d store=%b sbv=%b",
-                              cycle_cnt, rob_commit_rob_id, rob_commit_pc,
-                              rob_commit_has_rd, rob_commit_old_pdst, rob_commit_is_store,
+                              cycle_cnt, rob_commit_rob_id[0], rob_commit_pc[0],
+                              rob_commit_has_rd[0], rob_commit_old_pdst[0], rob_commit_is_store[0],
                               sb_commit_valid);
+                if (rob_commit_valid && rob_commit_mask[1])
+                    $fdisplay(dbg_fd, "[commit1] c=%0d rob=%0d pc=%08h", cycle_cnt,
+                              rob_commit_rob_id[1], rob_commit_pc[1]);
                 if (flush_valid)
                     $fdisplay(dbg_fd, "[flush] c=%0d rob=%0d target=%08h pred=%08h brpc=%08h head=%0d tail=%0d",
                               cycle_cnt, flush_rob_id, redirect_target, rob_lookup_pd_target,
@@ -994,11 +1143,17 @@ module student_top import pkg_cpu2026::*; #(
                 if (redirect_fire)
                     $fdisplay(dbg_fd, "[fetch] c=%0d REDIRECT to %08h", cycle_cnt, redirect_target);
                 if (exit_ack)
-                    $fdisplay(dbg_fd, "[cpu] c=%0d EXIT_ACK ic_rd=%0d dc_rd=%0d", cycle_cnt, cnt_ic_rd, cnt_dc_rd);                if (rn_valid)
+                    $fdisplay(dbg_fd, "[cpu] c=%0d EXIT_ACK ic_rd=%0d dc_rd=%0d", cycle_cnt, cnt_ic_rd, cnt_dc_rd);
+                if (rn_valid[0])
                     $fdisplay(dbg_fd, "[disp] c=%0d rob=%0d pc=%08h pdst=%0d pdt=%08h ps1=%0d s1r=%b ps2=%0d s2r=%b st=%b ld=%b",
-                              cycle_cnt, rn_alloc_rob_id, rn_pc, rn_alloc_pdst, fd_pd_target,
-                              rn_ps1, rn_s1_ready, rn_ps2, rn_s2_ready,
-                              rn_dec.is_store, rn_dec.is_load);
+                              cycle_cnt, rn_alloc_rob_id0, rn_pc0, rn_alloc_pdst0, fd_pd_target,
+                              rn_ps1_0, rn_s1r_0, rn_ps2_0, rn_s2r_0,
+                              rn_dec0.is_store, rn_dec0.is_load);
+                if (rn_valid[1])
+                    $fdisplay(dbg_fd, "[disp1] c=%0d rob=%0d pc=%08h pdst=%0d ps1=%0d s1r=%b ps2=%0d s2r=%b st=%b ld=%b",
+                              cycle_cnt, rn_alloc_rob_id1, rn_pc1, rn_alloc_pdst1,
+                              rn_ps1_1, rn_s1r_1, rn_ps2_1, rn_s2r_1,
+                              rn_dec1.is_store, rn_dec1.is_load);
                 if (DBG >= 2) begin
                     $fdisplay(dbg_fd, "[fetch] c=%0d pc=%08h fq=%0d lf=%b ic_hit=%b ro=%0d lsu=%0d tgt=%08h",
                               cycle_cnt, fetch_pc, fq_cnt, lf_on, ic_hit, ro_cnt, ls_state,

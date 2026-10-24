@@ -654,7 +654,6 @@ module student_top #(
         .issue_valid(iq_mdu_issue), .issue_rob_id(iq_mdu_issue_rob),
         .issue_pdst(iq_mdu_issue_pdst),
         .issue_op1(iq_mdu_issue_op1), .issue_op2(iq_mdu_issue_op2),
-        .issue_imm(), .issue_pc(),
         .issue_op(iq_mdu_issue_op),
         .flush_valid(flush_valid), .flush_rob_id(flush_rob_id)
     );
@@ -676,7 +675,7 @@ module student_top #(
         .issue_valid(iq_lsu_issue), .issue_rob_id(iq_lsu_issue_rob),
         .issue_pdst(iq_lsu_issue_pdst),
         .issue_op1(iq_lsu_issue_op1), .issue_op2(iq_lsu_issue_op2),
-        .issue_imm(iq_lsu_issue_imm), .issue_pc(),
+        .issue_imm(iq_lsu_issue_imm),
         .issue_op(iq_lsu_issue_op),
         .flush_valid(flush_valid), .flush_rob_id(flush_rob_id)
     );
@@ -745,7 +744,7 @@ module student_top #(
         default: begin alu_a = alu_r_op1; alu_b = alu_r_op2; alu_op_sel = alu_r_op[4:0]; end
         endcase
     end
-    alu u_alu (.op(alu_op_sel), .a(alu_a), .b(alu_b), .out(alu_out), .eq(), .lt(), .ltu());
+    alu u_alu (.op(alu_op_sel), .a(alu_a), .b(alu_b), .out(alu_out));
 
     assign cdb_valid[0] = alu_r_valid;
     assign cdb_pdst[0]  = alu_r_pdst;

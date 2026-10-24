@@ -4,7 +4,9 @@
 //       写完成释放、flush 清年轻条目
 // query 为纯组合：seq N 驱动 → cycle N 输出 → seq N+1 检查（与上一个 query 同 seq）
 // 退出值 = 错误计数（EXPECTED=0 即全过）
-module student_top import pkg_cpu2026::*; (
+import pkg_cpu2026::*;
+
+module student_top (
     input  logic        clock,
     input  logic        reset,
 

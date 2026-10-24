@@ -6,7 +6,9 @@
 //   分支在 BRU 解析：taken → 广播 flush（ROB/IQ/SB/rename checkpoint/取指重定向），
 //   ROB 逐拍归还被冲 pdst；已发出 AXI 写不可撤回（只有提交后的 store 才发写，SB 保证）
 // 时序链：派发 cycle N → rename/ROB/SB 于边沿 N+1 → IQ 于边沿 N+2 → FU 执行 → CDB
-module student_top import pkg_cpu2026::*; #(
+import pkg_cpu2026::*;
+
+module student_top #(
     parameter int FETCH_DEPTH = 4,
     parameter int FIFO_DEPTH  = 4,
     parameter int DBG         = 0
@@ -185,7 +187,8 @@ module student_top import pkg_cpu2026::*; #(
     // ================= 派发 =================
     logic [31:0] fd_pc, fd_instr, fd_pd_target;
     logic [31:0] fd_pc2, fd_instr2, fd_pd_target2;
-    dec_info_t   fd_dec, fd_dec2;
+    pkg_cpu2026::dec_info_t fd_dec;
+    pkg_cpu2026::dec_info_t fd_dec2;
     assign fd_pc    = fq[fq_rptr][63:32];
     assign fd_instr = fq[fq_rptr][31:0];
     assign fd_pd_target = fq[fq_rptr][95:64];
@@ -356,7 +359,8 @@ module student_top import pkg_cpu2026::*; #(
 
     // 派发锁存（与 rename 输出同沿）
     logic [1:0]  rn_valid;
-    dec_info_t   rn_dec0, rn_dec1;
+    pkg_cpu2026::dec_info_t rn_dec0;
+    pkg_cpu2026::dec_info_t rn_dec1;
     logic [31:0] rn_pc0, rn_pc1, rn_instr0, rn_instr1;
 
     always_ff @(posedge clock) begin
@@ -1019,7 +1023,7 @@ module student_top import pkg_cpu2026::*; #(
 
     // ================= 环序函数（基于 head 的年龄比较，无半环歧义）=================
     function automatic logic is_younger(input logic [ROB_W-1:0] a, b);
-        return (a - rob_head_id) > (b - rob_head_id);
+        is_younger = (a - rob_head_id) > (b - rob_head_id);
     endfunction
 
     // ================= 取指单元（I-cache 驱动）=================

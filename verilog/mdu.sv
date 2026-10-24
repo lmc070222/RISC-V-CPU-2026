@@ -2,7 +2,9 @@
 //   MUL 系列：单周期组合（64 位积，MUL 取低 32 位，MULH/MULHSU/MULHU 取高 32 位）
 //   DIV 系列：移位-减恢复法迭代，32 拍；除零/溢出语义按 notes/b-20261006 §4.2
 //   握手：start 脉冲启动（busy 时忽略），valid 单拍脉冲携带结果
-module mdu import pkg_cpu2026::*; #(
+import pkg_cpu2026::*;
+
+module mdu #(
     parameter int   DIV_MAX_CYCLES = 34,
     parameter logic MUL_PIPELINE    = 0
 ) (

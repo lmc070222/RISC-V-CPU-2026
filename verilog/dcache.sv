@@ -53,13 +53,13 @@ module dcache #(
     state_t state;
 
     function automatic logic [IDX_W-1:0] get_idx(input logic [31:0] a);
-        return a[OFF_W+2+IDX_W-1 : OFF_W+2];
+        get_idx = a[OFF_W+2+IDX_W-1 : OFF_W+2];
     endfunction
     function automatic logic [OFF_W-1:0] get_word(input logic [31:0] a);
-        return a[OFF_W+1 : 2];
+        get_word = a[OFF_W+1 : 2];
     endfunction
     function automatic logic [TAG_W-1:0] get_tag(input logic [31:0] a);
-        return a[31 : OFF_W+2+IDX_W];
+        get_tag = a[31 : OFF_W+2+IDX_W];
     endfunction
 
     // 被接收查询（D_LD/D_ST 判定用）

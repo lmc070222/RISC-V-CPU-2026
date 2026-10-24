@@ -5,7 +5,9 @@
 //   - x0 恒映射物理 0
 //   - PRF 读带 CDB 旁路（当拍写回可读）；pair 内 inst1 的源若命中 inst0 的 rd，则
 //     映射到 inst0 的新 pdst 且置未就绪（等待 CDB 唤醒）
-module rename import pkg_cpu2026::*; #(
+import pkg_cpu2026::*;
+
+module rename #(
     parameter int ARCH_NUM   = 32,
     parameter int PRF_NUM    = 48,
     parameter int PRF_W      = $clog2(PRF_NUM),
@@ -18,8 +20,8 @@ module rename import pkg_cpu2026::*; #(
 
     // ---- 派发输入（cycle N 有效，边沿 N+1 处理）；disp_valid[1] 表示成对派发 ----
     input  logic [1:0]          disp_valid,
-    input  dec_info_t           disp_dec0,
-    input  dec_info_t           disp_dec1,
+    input  pkg_cpu2026::dec_info_t     disp_dec0,
+    input  pkg_cpu2026::dec_info_t     disp_dec1,
     input  logic                ext_ready,
     input  logic [ROB_ID_W-1:0] next_rob_id,
     output logic                disp_ready,

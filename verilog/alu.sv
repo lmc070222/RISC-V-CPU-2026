@@ -1,6 +1,8 @@
 // alu: 算术/逻辑运算 + 分支比较辅助输出（eq/lt/ltu）
 // 移位量取 b[4:0]；SLT/SLTU 直接复用 lt/ltu
-module alu import pkg_cpu2026::*; (
+import pkg_cpu2026::*;
+
+module alu (
     input  logic [4:0]  op,
     input  logic [31:0] a,
     input  logic [31:0] b,

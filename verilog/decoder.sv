@@ -1,9 +1,11 @@
 // decoder: RV32IM 全量译码（纯组合）
 // 覆盖：RV32I 37 条 + M 扩展 8 条 + Load/Store 8 条；CSR/FENCE/ECALL/EBREAK/未知编码 → illegal=1
 // 编码表与立即数表见 notes/b-20261006-执行单元规格.md §1/§2
-module decoder import pkg_cpu2026::*; (
+import pkg_cpu2026::*;
+
+module decoder (
     input  logic [31:0] instr,
-    output dec_info_t   dec
+    output pkg_cpu2026::dec_info_t   dec
 );
 
     logic [6:0]  opcode;
